@@ -2,9 +2,11 @@ import requests
 import json
 import argparse
 import sys
+import tempfile
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 # ==================== CONFIG - OPTIMIZED FOR RTX 3070 8GB + 64GB RAM ====================
 OLLAMA_HOST = "http://localhost:11434"
@@ -16,6 +18,7 @@ CONFIG_FILE = Path("colony_config.json")
 DEFAULT_DAYS = 7
 API_BASE = "https://thecolony.cc/api/v1"
 OLLAMA_TIMEOUT = 600
+MEMORY_MAX_AGE_DAYS = 90
 
 OLLAMA_OPTIONS = {
     "temperature": 0.3,
@@ -59,10 +62,24 @@ def load_config() -> Dict:
     return {}
 
 def save_config(config: Dict):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    _atomic_json_write(CONFIG_FILE, config)
 
-def register_agent(username: str) -> str | None:
+
+def _atomic_json_write(path: Path, data):
+    """Write JSON atomically: write to a temp file then rename to avoid corruption."""
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+def register_agent(username: str) -> Optional[str]:
     payload = {
         "username": username,
         "display_name": "Qwen 3.5 Jorwhol Analyzer",
@@ -82,7 +99,7 @@ def register_agent(username: str) -> str | None:
         print(f"❌ Registration failed: {e}")
         return None
 
-def get_bearer_token(api_key: str) -> str | None:
+def get_bearer_token(api_key: str) -> Optional[str]:
     """Fetch a fresh bearer token. Called on every run."""
     try:
         resp = requests.post(f"{API_BASE}/auth/token", json={"api_key": api_key}, timeout=30)
@@ -107,11 +124,15 @@ def get_bearer_token(api_key: str) -> str | None:
         return None
 
 # ==================== VOTING & LANGUAGE SETTING ====================
-def cast_vote(post_id: str, value: int, bearer_token: str, api_key: str) -> bool:
-    """Cast vote with improved error handling and 401 retry."""
+def cast_vote(post_id: str, value: int, bearer_token: str, api_key: str, _retried: bool = False) -> tuple[bool, Optional[str]]:
+    """Cast vote with error handling and single 401 retry.
+
+    Returns (success, new_bearer_token). new_bearer_token is non-None only
+    when the token was refreshed, so the caller can update its reference.
+    """
     if not bearer_token:
         print("   ❌ No bearer token available — cannot vote")
-        return False
+        return False, None
 
     url = f"{API_BASE}/posts/{post_id}/vote"
     headers = {"Authorization": f"Bearer {bearer_token}", "Content-Type": "application/json"}
@@ -122,36 +143,44 @@ def cast_vote(post_id: str, value: int, bearer_token: str, api_key: str) -> bool
         if resp.status_code in (200, 204):
             action = "Upvoted" if value == 1 else "Downvoted"
             print(f"   ✅ {action} successfully!")
-            return True
+            return True, None
 
-        elif resp.status_code == 401:
+        elif resp.status_code == 401 and not _retried:
             print("   ❌ Token expired/invalid (401) — fetching fresh token...")
             new_token = get_bearer_token(api_key)
             if new_token:
-                return cast_vote(post_id, value, new_token, api_key)  # retry once
-            return False
+                success, _ = cast_vote(post_id, value, new_token, api_key, _retried=True)
+                return success, new_token
+            return False, None
+
+        elif resp.status_code == 401:
+            print("   ❌ Token still invalid after refresh — giving up")
+            return False, None
 
         elif resp.status_code >= 400:
             print(f"   ❌ Vote failed ({resp.status_code}): {resp.text[:200]}")
-            return False
+            return False, None
 
         else:
             print(f"   ⚠️  Unexpected response ({resp.status_code})")
-            return False
+            return False, None
 
     except Exception as e:
         print(f"   ❌ Vote error: {e}")
-        return False
+        return False, None
 
 
-def set_post_language(post_id: str, lang_code: str, bearer_token: str, api_key: str) -> bool:
-    """Set post language with improved error handling and 401 retry."""
+def set_post_language(post_id: str, lang_code: str, bearer_token: str, api_key: str, _retried: bool = False) -> tuple[bool, Optional[str]]:
+    """Set post language with error handling and single 401 retry.
+
+    Returns (success, new_bearer_token).
+    """
     if not bearer_token or not lang_code or lang_code.strip().lower() == "en":
-        return False
+        return False, None
 
     lang_code = lang_code.strip().lower()
     if len(lang_code) < 2:
-        return False
+        return False, None
 
     url = f"{API_BASE}/posts/{post_id}/language?language={lang_code}"
     headers = {"Authorization": f"Bearer {bearer_token}"}
@@ -161,35 +190,39 @@ def set_post_language(post_id: str, lang_code: str, bearer_token: str, api_key: 
 
         if resp.status_code == 200:
             print(f"   🌐 Language set to '{lang_code}'")
-            return True
+            return True, None
         elif resp.status_code == 409:
             print(f"   ⚠️  Language already set (skipped)")
-            return True
+            return True, None
         elif resp.status_code == 422:
             print(f"   ❌ Invalid language code '{lang_code}'")
-            return False
-        elif resp.status_code == 401:
+            return False, None
+        elif resp.status_code == 401 and not _retried:
             print("   ❌ Token expired/invalid (401) — fetching fresh token...")
             new_token = get_bearer_token(api_key)
             if new_token:
-                return set_post_language(post_id, lang_code, new_token, api_key)  # retry once
-            return False
+                success, _ = set_post_language(post_id, lang_code, new_token, api_key, _retried=True)
+                return success, new_token
+            return False, None
+        elif resp.status_code == 401:
+            print("   ❌ Token still invalid after refresh — giving up")
+            return False, None
         elif resp.status_code >= 500:
             print(f"   ❌ Server error ({resp.status_code}) while setting language — try again later")
-            return False
+            return False, None
         else:
             print(f"   ❌ Language set failed ({resp.status_code}): {resp.text[:200]}")
-            return False
+            return False, None
 
     except requests.exceptions.Timeout:
         print(f"   ❌ Language API timeout")
-        return False
+        return False, None
     except Exception as e:
         print(f"   ❌ Language API error: {e}")
-        return False
+        return False, None
 
 # ==================== OLLAMA CALL ====================
-def call_ollama(model: str, messages: List[Dict]) -> Dict | None:
+def call_ollama(model: str, messages: List[Dict]) -> Optional[Dict]:
     payload = {
         "model": model,
         "messages": messages,
@@ -226,12 +259,22 @@ def fetch_posts(sort: str = "new", limit: int = DEFAULT_LIMIT) -> List[Dict]:
         print(f"❌ Failed to fetch posts: {e}")
         return []
 
-def fetch_post_and_comments(post_id: str) -> Dict:
+def fetch_post_and_comments(post_id: str) -> Optional[Dict]:
+    """Fetch a post and its top comments. Returns None on failure."""
     post_url = f"{API_BASE}/posts/{post_id}"
     comments_url = f"{API_BASE}/posts/{post_id}/comments?limit={MAX_COMMENTS}"
-    post = requests.get(post_url, timeout=30).json()
-    comments_resp = requests.get(comments_url, timeout=30)
-    comments = comments_resp.json().get("comments", []) if comments_resp.ok else []
+    try:
+        post_resp = requests.get(post_url, timeout=30)
+        post_resp.raise_for_status()
+        post = post_resp.json()
+    except Exception as e:
+        print(f"   ❌ Failed to fetch post {post_id[:8]}: {e}")
+        return None
+    try:
+        comments_resp = requests.get(comments_url, timeout=30)
+        comments = comments_resp.json().get("comments", []) if comments_resp.ok else []
+    except Exception:
+        comments = []
     return {"post": post, "comments": comments[:MAX_COMMENTS]}
 
 def build_analysis_text(post_data: Dict) -> str:
@@ -251,7 +294,7 @@ def build_analysis_text(post_data: Dict) -> str:
         text += "No replies yet.\n"
     return text.strip()
 
-def analyze_post(post_data: Dict, model: str) -> Dict | None:
+def analyze_post(post_data: Dict, model: str) -> Optional[Dict]:
     content = build_analysis_text(post_data)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -285,11 +328,40 @@ def load_memory() -> Dict:
     return {}
 
 def save_memory(memory: Dict):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(memory, f, indent=2, ensure_ascii=False)
+    _atomic_json_write(MEMORY_FILE, memory)
 
 def get_processed_ids(memory: Dict) -> Set[str]:
-    return {item.get("post_id") for item in memory.values() if "post_id" in item}
+    """Return IDs of successfully analyzed posts (skip entries with score 0 / failed analyses)."""
+    return {
+        item.get("post_id")
+        for item in memory.values()
+        if "post_id" in item and item.get("score", 0) > 0
+    }
+
+
+def prune_memory(memory: Dict, max_age_days: int = MEMORY_MAX_AGE_DAYS) -> Dict:
+    """Remove entries older than max_age_days and entries with failed analyses (score 0)."""
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    pruned = {}
+    removed = 0
+    for key, item in memory.items():
+        # Remove failed analyses so they can be retried
+        if item.get("score", 0) == 0:
+            removed += 1
+            continue
+        analyzed_at = item.get("analyzed_at", "")
+        if analyzed_at:
+            try:
+                dt = datetime.fromisoformat(analyzed_at)
+                if dt < cutoff:
+                    removed += 1
+                    continue
+            except (ValueError, TypeError):
+                pass
+        pruned[key] = item
+    if removed > 0:
+        print(f"🧹 Pruned {removed} stale/failed entries from memory")
+    return pruned
 
 # ==================== MAIN ====================
 def main():
@@ -325,12 +397,17 @@ def main():
         print("⚠️  Running without voting capability (token unavailable)")
 
     memory = load_memory()
+    memory = prune_memory(memory)
     processed = get_processed_ids(memory) if not args.force else set()
     results = []
     new_analyses = 0
 
     if args.post_id:
         data = fetch_post_and_comments(args.post_id)
+        if data is None:
+            print("❌ Could not fetch post — aborting")
+            save_memory(memory)
+            sys.exit(1)
         judgment = analyze_post(data, args.model)
         if judgment:
             judgment["analyzed_at"] = datetime.now().isoformat()
@@ -353,6 +430,9 @@ def main():
 
             print(f"🔍 Analyzing: {post_id[:8]}... {title}")
             data = fetch_post_and_comments(post_id)
+            if data is None:
+                print("   ⚠️  Could not fetch post — skipping")
+                continue
             judgment = analyze_post(data, args.model)
 
             if judgment is None:
@@ -374,13 +454,17 @@ def main():
                     if args.confirm:
                         if input(f"   Confirm? [Y/n]: ").strip().lower() not in ["", "y", "yes"]:
                             continue
-                    cast_vote(post_id, value, bearer_token, api_key)
+                    success, new_token = cast_vote(post_id, value, bearer_token, api_key)
+                    if new_token:
+                        bearer_token = new_token
 
             # === AUTO LANGUAGE TAGGING ===
             if bearer_token:
                 lang = judgment.get("language", "en").strip().lower()
                 if lang and lang != "en":
-                    set_post_language(post_id, lang, bearer_token, api_key)
+                    _, new_token = set_post_language(post_id, lang, bearer_token, api_key)
+                    if new_token:
+                        bearer_token = new_token
 
     save_memory(memory)
     print(f"💾 Memory updated: {len(memory)} posts | Added {new_analyses} new")
@@ -401,7 +485,7 @@ def main():
 if __name__ == "__main__":
     try:
         requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-    except:
+    except (requests.ConnectionError, requests.Timeout):
         print("❌ Ollama not running. Start with: ollama serve")
         sys.exit(1)
     main()
