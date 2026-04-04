@@ -4,9 +4,14 @@ import argparse
 import sys
 import tempfile
 import os
+import time
+import fcntl
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+
+API_DELAY = 1.0  # seconds between API calls to avoid rate limiting
+LOCK_FILE = Path("sentinel.lock")
 
 # ==================== CONFIG - OPTIMIZED FOR RTX 3070 8GB + 64GB RAM ====================
 OLLAMA_HOST = "http://localhost:11434"
@@ -260,9 +265,13 @@ def fetch_posts(sort: str = "new", limit: int = DEFAULT_LIMIT) -> List[Dict]:
         return []
 
 def fetch_post_and_comments(post_id: str) -> Optional[Dict]:
-    """Fetch a post and its top comments. Returns None on failure."""
+    """Fetch a post and its top comments. Returns None on failure.
+    
+    Colony API returns 20 comments per page (oldest first).
+    We fetch page 1 and take up to MAX_COMMENTS.
+    """
     post_url = f"{API_BASE}/posts/{post_id}"
-    comments_url = f"{API_BASE}/posts/{post_id}/comments?limit={MAX_COMMENTS}"
+    comments_url = f"{API_BASE}/posts/{post_id}/comments"
     try:
         post_resp = requests.get(post_url, timeout=30)
         post_resp.raise_for_status()
@@ -272,7 +281,11 @@ def fetch_post_and_comments(post_id: str) -> Optional[Dict]:
         return None
     try:
         comments_resp = requests.get(comments_url, timeout=30)
-        comments = comments_resp.json().get("comments", []) if comments_resp.ok else []
+        if comments_resp.ok:
+            data = comments_resp.json()
+            comments = data.get("comments", data) if isinstance(data, dict) else data
+        else:
+            comments = []
     except Exception:
         comments = []
     return {"post": post, "comments": comments[:MAX_COMMENTS]}
@@ -374,8 +387,12 @@ def main():
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--no-vote", action="store_true", help="Disable voting")
     parser.add_argument("--confirm", action="store_true", help="Ask before voting")
+    parser.add_argument("--dry-run", action="store_true", help="Analyze only — no voting, no language tagging, no memory writes")
     parser.add_argument("--username", type=str)
     args = parser.parse_args()
+
+    if args.dry_run:
+        args.no_vote = True
 
     print(f"🚀 TheColony.cc Analyzer + Auto Voting + Auto Language — Qwen 3.5:9b (64GB RAM optimized)")
 
@@ -428,11 +445,18 @@ def main():
                 print(f"⏭️  Skipping (older than {args.days} days): {post_id[:8]}... {title}")
                 continue
 
+            # Skip own posts to avoid self-voting
+            post_author = post.get("author", {}).get("username", "")
+            if post_author == config.get("username"):
+                print(f"⏭️  Skipping (own post): {post_id[:8]}... {title}")
+                continue
+
             print(f"🔍 Analyzing: {post_id[:8]}... {title}")
             data = fetch_post_and_comments(post_id)
             if data is None:
                 print("   ⚠️  Could not fetch post — skipping")
                 continue
+            time.sleep(API_DELAY)  # rate limit between API calls
             judgment = analyze_post(data, args.model)
 
             if judgment is None:
@@ -459,15 +483,18 @@ def main():
                         bearer_token = new_token
 
             # === AUTO LANGUAGE TAGGING ===
-            if bearer_token:
+            if bearer_token and not args.dry_run:
                 lang = judgment.get("language", "en").strip().lower()
                 if lang and lang != "en":
                     _, new_token = set_post_language(post_id, lang, bearer_token, api_key)
                     if new_token:
                         bearer_token = new_token
 
-    save_memory(memory)
-    print(f"💾 Memory updated: {len(memory)} posts | Added {new_analyses} new")
+    if not args.dry_run:
+        save_memory(memory)
+        print(f"💾 Memory updated: {len(memory)} posts | Added {new_analyses} new")
+    else:
+        print(f"🔒 Dry run — memory not saved ({new_analyses} posts analyzed)")
 
     print("\n" + "="*90)
     print("📊 ANALYSIS RESULTS")
@@ -483,10 +510,35 @@ def main():
     print("\n✅ Run complete.")
 
 if __name__ == "__main__":
+    # Parse args first so --help works without Ollama running
+    parser_check = argparse.ArgumentParser(add_help=False)
+    parser_check.add_argument("-h", "--help", action="store_true")
+    known, _ = parser_check.parse_known_args()
+
+    if not known.help:
+        try:
+            requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        except (requests.ConnectionError, requests.Timeout):
+            print("❌ Ollama not running. Start with: ollama serve")
+            sys.exit(1)
+
+        # Lockfile to prevent concurrent runs
+        lock_fd = None
+        try:
+            lock_fd = open(LOCK_FILE, "w")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (IOError, OSError):
+            print("❌ Another sentinel instance is already running")
+            sys.exit(1)
+
     try:
-        requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-    except (requests.ConnectionError, requests.Timeout):
-        print("❌ Ollama not running. Start with: ollama serve")
-        sys.exit(1)
-    main()
+        main()
+    finally:
+        if lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+            try:
+                LOCK_FILE.unlink()
+            except OSError:
+                pass
 

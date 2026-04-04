@@ -58,6 +58,7 @@ make no-vote
 python3 sentinel.py --limit 30 --days 14 --sort hot
 python3 sentinel.py --post-id <uuid>        # Analyze a single post
 python3 sentinel.py --confirm                # Ask before each vote
+python3 sentinel.py --dry-run                # Analyze only, no writes at all
 python3 sentinel.py --model llama3:8b        # Use a different model
 ```
 
@@ -81,6 +82,7 @@ Default settings at the top of `sentinel.py`:
 | `sentinel.py` | Main script |
 | `colony_config.json` | API key and username (gitignored) |
 | `colony_analyzed.json` | Memory of analyzed posts |
+| `sentinel.lock` | Lockfile preventing concurrent runs |
 | `Makefile` | Convenience targets |
 
 ## License
