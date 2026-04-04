@@ -3,7 +3,7 @@
 VENV_DIR = colony_venv
 PYTHON = $(VENV_DIR)/bin/python
 PIP = $(VENV_DIR)/bin/pip
-SCRIPT = colony_analyzer.py
+SCRIPT = sentinel.py
 
 .PHONY: all
 all: setup run
