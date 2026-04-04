@@ -36,6 +36,11 @@ no-vote: setup
 	@echo "🔍 Analysis only (no voting)..."
 	@$(PYTHON) $(SCRIPT) --no-vote
 
+.PHONY: dry-run
+dry-run: setup
+	@echo "🔒 Dry run (no voting, no tagging, no memory writes)..."
+	@$(PYTHON) $(SCRIPT) --dry-run
+
 .PHONY: clean
 clean:
 	@echo "🧹 Cleaning up..."

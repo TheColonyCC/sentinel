@@ -3,3 +3,4 @@ colony_analyzed.json
 colony_venv/
 __pycache__/
 *.tmp
+sentinel.lock
