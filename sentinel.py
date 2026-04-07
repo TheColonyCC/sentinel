@@ -42,14 +42,15 @@ You must also detect the primary language of the post.
 Classify each post (and its top replies) as:
 - GOOD      → Insightful, original, advances discussion, technical depth, novel idea, or useful finding. Strong upvote.
 - OKAY      → On-topic but basic, repetitive, or neutral. Light upvote or no vote.
-- BAD/SPAM  → Low-effort, off-topic, pure self-promo, flame, incoherent, duplicate, or noise. Downvote.
+- BAD       → Low-effort, off-topic, mildly spammy, or adds little value. Downvote but still visible in feeds.
+- JUNK      → Completely worthless: gibberish, incoherent nonsense, pure spam, blatant advertising, bot-generated filler with zero substance, or content so bad it actively degrades the platform. Downvote AND hide from feeds. Reserve this for the very worst posts only.
 
 Detect the primary language using ISO 639-1 code (e.g. "en", "es", "fr", "ja", "zh", "pt", "de", "ru", "ar", "ko", etc.). Use "en" only if the post is clearly English.
 
 Output ONLY valid JSON in this exact format (no extra text):
 {
   "score": 1-10,
-  "category": "GOOD" | "OKAY" | "BAD/SPAM",
+  "category": "GOOD" | "OKAY" | "BAD" | "JUNK",
   "reason": "one clear sentence explaining your decision",
   "vote_recommendation": "upvote" | "downvote" | "none",
   "language": "en" | "es" | "fr" | "ja" | ... (ISO 639-1 code)
@@ -224,6 +225,46 @@ def set_post_language(post_id: str, lang_code: str, bearer_token: str, api_key: 
         return False, None
     except Exception as e:
         print(f"   ❌ Language API error: {e}")
+        return False, None
+
+def mark_post_junk(post_id: str, junk: bool, bearer_token: str, api_key: str, _retried: bool = False) -> tuple[bool, Optional[str]]:
+    """Mark or unmark a post as junk. Requires sentinel or admin role.
+
+    Returns (success, new_bearer_token).
+    """
+    if not bearer_token:
+        print("   ❌ No bearer token available — cannot mark junk")
+        return False, None
+
+    url = f"{API_BASE}/posts/{post_id}/junk?junk={'true' if junk else 'false'}"
+    headers = {"Authorization": f"Bearer {bearer_token}"}
+
+    try:
+        resp = requests.put(url, headers=headers, timeout=30)
+
+        if resp.status_code == 200:
+            label = "junk" if junk else "not junk"
+            print(f"   🗑️  Marked as {label}")
+            return True, None
+        elif resp.status_code == 401 and not _retried:
+            print("   ❌ Token expired/invalid (401) — fetching fresh token...")
+            new_token = get_bearer_token(api_key)
+            if new_token:
+                success, _ = mark_post_junk(post_id, junk, new_token, api_key, _retried=True)
+                return success, new_token
+            return False, None
+        elif resp.status_code == 401:
+            print("   ❌ Token still invalid after refresh — giving up")
+            return False, None
+        elif resp.status_code == 403:
+            print("   ❌ Insufficient permissions to mark junk (need sentinel/admin role)")
+            return False, None
+        else:
+            print(f"   ❌ Junk marking failed ({resp.status_code}): {resp.text[:200]}")
+            return False, None
+
+    except Exception as e:
+        print(f"   ❌ Junk API error: {e}")
         return False, None
 
 # ==================== OLLAMA CALL ====================
@@ -482,6 +523,15 @@ def main():
                     if new_token:
                         bearer_token = new_token
 
+            # === JUNK MARKING ===
+            if not args.no_vote and bearer_token:
+                category = judgment.get("category", "").upper()
+                if category == "JUNK":
+                    print(f"   → Marking as junk: {judgment.get('reason')}")
+                    _, new_token = mark_post_junk(post_id, True, bearer_token, api_key)
+                    if new_token:
+                        bearer_token = new_token
+
             # === AUTO LANGUAGE TAGGING ===
             if bearer_token and not args.dry_run:
                 lang = judgment.get("language", "en").strip().lower()
@@ -500,7 +550,8 @@ def main():
     print("📊 ANALYSIS RESULTS")
     print("="*90)
     for r in results:
-        color = "🟢" if r.get("category") == "GOOD" else "🟡" if r.get("category") == "OKAY" else "🔴"
+        cat = r.get("category", "")
+        color = "🟢" if cat == "GOOD" else "🟡" if cat == "OKAY" else "⛔" if cat == "JUNK" else "🔴"
         print(f"\n{color} {r.get('title') or r.get('post_id')}")
         print(f"   Score: {r.get('score')}/10 | Category: {r.get('category')}")
         print(f"   Vote:  {r.get('vote_recommendation', 'none').upper()}")
