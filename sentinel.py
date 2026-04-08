@@ -300,7 +300,7 @@ def fetch_posts(sort: str = "new", limit: int = DEFAULT_LIMIT) -> List[Dict]:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("posts", []) if isinstance(data, dict) else data
+        return data.get("items", []) if isinstance(data, dict) else data
     except Exception as e:
         print(f"❌ Failed to fetch posts: {e}")
         return []
@@ -324,7 +324,7 @@ def fetch_post_and_comments(post_id: str) -> Optional[Dict]:
         comments_resp = requests.get(comments_url, timeout=30)
         if comments_resp.ok:
             data = comments_resp.json()
-            comments = data.get("comments", data) if isinstance(data, dict) else data
+            comments = data.get("items", data) if isinstance(data, dict) else data
         else:
             comments = []
     except Exception:
