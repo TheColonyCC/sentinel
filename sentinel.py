@@ -1,19 +1,43 @@
-import requests
-import json
+#!/usr/bin/env python3
+"""Sentinel — automated content moderation agent for The Colony.
+
+Uses a local LLM (via Ollama) to score posts on quality, then:
+  - Casts votes (upvote good, downvote spam)
+  - Marks JUNK posts (sentinel/admin role required)
+  - Tags the primary language
+
+Two modes:
+  scan      One-shot pass over recent posts (cron-friendly).
+  webhook   Long-running HTTP server, analyzes posts as they arrive.
+
+All Colony API calls go through ``colony-sdk``, which handles auth, token
+refresh, typed errors, and configurable retries on 429/502/503/504.
+"""
+
+from __future__ import annotations
+
 import argparse
+import fcntl
+import json
+import logging
+import os
 import sys
 import tempfile
-import os
-import time
-import fcntl
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional, Set
 
-API_DELAY = 1.0  # seconds between API calls to avoid rate limiting
+import requests  # only used for the local Ollama call
+
+from colony_sdk import (
+    ColonyAPIError,
+    ColonyClient,
+    ColonyNotFoundError,
+    verify_webhook,
+)
+
+# ─── Config ─────────────────────────────────────────────────────────────
 LOCK_FILE = Path("sentinel.lock")
-
-# ==================== CONFIG - OPTIMIZED FOR RTX 3070 8GB + 64GB RAM ====================
 OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3.5:9b-q4_K_M"
 DEFAULT_LIMIT = 20
@@ -21,9 +45,14 @@ MAX_COMMENTS = 6
 MEMORY_FILE = Path("colony_analyzed.json")
 CONFIG_FILE = Path("colony_config.json")
 DEFAULT_DAYS = 7
-API_BASE = "https://thecolony.cc/api/v1"
 OLLAMA_TIMEOUT = 600
 MEMORY_MAX_AGE_DAYS = 90
+
+DEFAULT_USERNAME = "qwen-jorwhol-analyzer"
+DEFAULT_DISPLAY_NAME = "Qwen 3.5 Jorwhol Analyzer"
+DEFAULT_BIO = (
+    "Local Qwen 3.5 moderator that scores, votes, and sets language on TheColony.cc posts."
+)
 
 OLLAMA_OPTIONS = {
     "temperature": 0.3,
@@ -31,10 +60,9 @@ OLLAMA_OPTIONS = {
     "keep_alive": "30m",
     "num_gpu_layers": -1,
     "num_batch": 512,
-    "num_thread": 0
+    "num_thread": 0,
 }
 
-# ==================== UPDATED SYSTEM PROMPT ====================
 SYSTEM_PROMPT = """You are an expert moderator for TheColony.cc, a high-signal collaborative platform for AI agents and humans.
 Your job is to evaluate posts and their replies for quality, originality, relevance, and value to the community.
 You must also detect the primary language of the post.
@@ -57,23 +85,12 @@ Output ONLY valid JSON in this exact format (no extra text):
 }
 """
 
-# ==================== AUTH HELPERS ====================
-def load_config() -> Dict:
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_config(config: Dict):
-    _atomic_json_write(CONFIG_FILE, config)
+logger = logging.getLogger("sentinel")
 
 
-def _atomic_json_write(path: Path, data):
-    """Write JSON atomically: write to a temp file then rename to avoid corruption."""
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+# ─── Atomic JSON persistence ────────────────────────────────────────────
+def _atomic_json_write(path: Path, data: dict) -> None:
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent or ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -85,281 +102,66 @@ def _atomic_json_write(path: Path, data):
             pass
         raise
 
-def register_agent(username: str) -> Optional[str]:
-    payload = {
-        "username": username,
-        "display_name": "Qwen 3.5 Jorwhol Analyzer",
-        "bio": "Local Qwen 3.5 moderator that scores, votes, and sets language on TheColony.cc posts.",
-        "capabilities": {"skills": ["analysis", "moderation", "voting", "language-tagging"]}
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_config(config: dict) -> None:
+    _atomic_json_write(CONFIG_FILE, config)
+
+
+def load_memory() -> dict:
+    if MEMORY_FILE.exists():
+        try:
+            with open(MEMORY_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_memory(memory: dict) -> None:
+    _atomic_json_write(MEMORY_FILE, memory)
+
+
+def get_processed_ids(memory: dict) -> set[str]:
+    """Return IDs of successfully analyzed posts (skip score=0 failed entries)."""
+    return {
+        item["post_id"]
+        for item in memory.values()
+        if "post_id" in item and item.get("score", 0) > 0
     }
-    try:
-        resp = requests.post(f"{API_BASE}/auth/register", json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        api_key = data.get("api_key")
-        if api_key:
-            print(f"✅ Agent registered as @{username}")
-            return api_key
-        return None
-    except Exception as e:
-        print(f"❌ Registration failed: {e}")
-        return None
-
-def get_bearer_token(api_key: str) -> Optional[str]:
-    """Fetch a fresh bearer token. Called on every run."""
-    try:
-        resp = requests.post(f"{API_BASE}/auth/token", json={"api_key": api_key}, timeout=30)
-        
-        if resp.status_code == 401:
-            print("❌ Invalid or revoked API key (401). Re-register the agent.")
-            return None
-        if resp.status_code >= 400:
-            print(f"❌ Token request failed ({resp.status_code}): {resp.text[:200]}")
-            return None
-            
-        resp.raise_for_status()
-        data = resp.json()
-        token = data.get("access_token") or data.get("token")
-        if token:
-            print("🔐 Fresh bearer token obtained")
-            return token
-        print("⚠️  No token in response")
-        return None
-    except Exception as e:
-        print(f"❌ Bearer token error: {e}")
-        return None
-
-# ==================== VOTING & LANGUAGE SETTING ====================
-def cast_vote(post_id: str, value: int, bearer_token: str, api_key: str, _retried: bool = False) -> tuple[bool, Optional[str]]:
-    """Cast vote with error handling and single 401 retry.
-
-    Returns (success, new_bearer_token). new_bearer_token is non-None only
-    when the token was refreshed, so the caller can update its reference.
-    """
-    if not bearer_token:
-        print("   ❌ No bearer token available — cannot vote")
-        return False, None
-
-    url = f"{API_BASE}/posts/{post_id}/vote"
-    headers = {"Authorization": f"Bearer {bearer_token}", "Content-Type": "application/json"}
-
-    try:
-        resp = requests.post(url, json={"value": value}, headers=headers, timeout=30)
-
-        if resp.status_code in (200, 204):
-            action = "Upvoted" if value == 1 else "Downvoted"
-            print(f"   ✅ {action} successfully!")
-            return True, None
-
-        elif resp.status_code == 401 and not _retried:
-            print("   ❌ Token expired/invalid (401) — fetching fresh token...")
-            new_token = get_bearer_token(api_key)
-            if new_token:
-                success, _ = cast_vote(post_id, value, new_token, api_key, _retried=True)
-                return success, new_token
-            return False, None
-
-        elif resp.status_code == 401:
-            print("   ❌ Token still invalid after refresh — giving up")
-            return False, None
-
-        elif resp.status_code >= 400:
-            print(f"   ❌ Vote failed ({resp.status_code}): {resp.text[:200]}")
-            return False, None
-
-        else:
-            print(f"   ⚠️  Unexpected response ({resp.status_code})")
-            return False, None
-
-    except Exception as e:
-        print(f"   ❌ Vote error: {e}")
-        return False, None
 
 
-def set_post_language(post_id: str, lang_code: str, bearer_token: str, api_key: str, _retried: bool = False) -> tuple[bool, Optional[str]]:
-    """Set post language with error handling and single 401 retry.
+def prune_memory(memory: dict, max_age_days: int = MEMORY_MAX_AGE_DAYS) -> dict:
+    """Drop entries older than max_age_days and any failed analyses (score 0)."""
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    pruned: dict = {}
+    removed = 0
+    for key, item in memory.items():
+        if item.get("score", 0) == 0:
+            removed += 1
+            continue
+        analyzed_at = item.get("analyzed_at", "")
+        if analyzed_at:
+            try:
+                if datetime.fromisoformat(analyzed_at) < cutoff:
+                    removed += 1
+                    continue
+            except (ValueError, TypeError):
+                pass
+        pruned[key] = item
+    if removed:
+        print(f"🧹 Pruned {removed} stale/failed entries from memory")
+    return pruned
 
-    Returns (success, new_bearer_token).
-    """
-    if not bearer_token or not lang_code or lang_code.strip().lower() == "en":
-        return False, None
-
-    lang_code = lang_code.strip().lower()
-    if len(lang_code) < 2:
-        return False, None
-
-    url = f"{API_BASE}/posts/{post_id}/language?language={lang_code}"
-    headers = {"Authorization": f"Bearer {bearer_token}"}
-
-    try:
-        resp = requests.put(url, headers=headers, timeout=30)
-
-        if resp.status_code == 200:
-            print(f"   🌐 Language set to '{lang_code}'")
-            return True, None
-        elif resp.status_code == 409:
-            print(f"   ⚠️  Language already set (skipped)")
-            return True, None
-        elif resp.status_code == 422:
-            print(f"   ❌ Invalid language code '{lang_code}'")
-            return False, None
-        elif resp.status_code == 401 and not _retried:
-            print("   ❌ Token expired/invalid (401) — fetching fresh token...")
-            new_token = get_bearer_token(api_key)
-            if new_token:
-                success, _ = set_post_language(post_id, lang_code, new_token, api_key, _retried=True)
-                return success, new_token
-            return False, None
-        elif resp.status_code == 401:
-            print("   ❌ Token still invalid after refresh — giving up")
-            return False, None
-        elif resp.status_code >= 500:
-            print(f"   ❌ Server error ({resp.status_code}) while setting language — try again later")
-            return False, None
-        else:
-            print(f"   ❌ Language set failed ({resp.status_code}): {resp.text[:200]}")
-            return False, None
-
-    except requests.exceptions.Timeout:
-        print(f"   ❌ Language API timeout")
-        return False, None
-    except Exception as e:
-        print(f"   ❌ Language API error: {e}")
-        return False, None
-
-def mark_post_junk(post_id: str, junk: bool, bearer_token: str, api_key: str, _retried: bool = False) -> tuple[bool, Optional[str]]:
-    """Mark or unmark a post as junk. Requires sentinel or admin role.
-
-    Returns (success, new_bearer_token).
-    """
-    if not bearer_token:
-        print("   ❌ No bearer token available — cannot mark junk")
-        return False, None
-
-    url = f"{API_BASE}/posts/{post_id}/junk?junk={'true' if junk else 'false'}"
-    headers = {"Authorization": f"Bearer {bearer_token}"}
-
-    try:
-        resp = requests.put(url, headers=headers, timeout=30)
-
-        if resp.status_code == 200:
-            label = "junk" if junk else "not junk"
-            print(f"   🗑️  Marked as {label}")
-            return True, None
-        elif resp.status_code == 401 and not _retried:
-            print("   ❌ Token expired/invalid (401) — fetching fresh token...")
-            new_token = get_bearer_token(api_key)
-            if new_token:
-                success, _ = mark_post_junk(post_id, junk, new_token, api_key, _retried=True)
-                return success, new_token
-            return False, None
-        elif resp.status_code == 401:
-            print("   ❌ Token still invalid after refresh — giving up")
-            return False, None
-        elif resp.status_code == 403:
-            print("   ❌ Insufficient permissions to mark junk (need sentinel/admin role)")
-            return False, None
-        else:
-            print(f"   ❌ Junk marking failed ({resp.status_code}): {resp.text[:200]}")
-            return False, None
-
-    except Exception as e:
-        print(f"   ❌ Junk API error: {e}")
-        return False, None
-
-# ==================== OLLAMA CALL ====================
-def call_ollama(model: str, messages: List[Dict]) -> Optional[Dict]:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "format": "json",
-        "options": OLLAMA_OPTIONS
-    }
-    try:
-        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
-        if resp.status_code == 500:
-            print("❌ Ollama 500 Internal Server Error — model failed to load/run.")
-            print("   Fix: pkill ollama && ollama serve")
-            return None
-        resp.raise_for_status()
-        result = resp.json()
-        content = result["message"]["content"].strip()
-        return json.loads(content)
-    except requests.exceptions.Timeout:
-        print("❌ Ollama timeout — post will retry next run")
-        return None
-    except Exception as e:
-        print(f"❌ Ollama error: {e}")
-        return None
-
-# ==================== FETCH & ANALYSIS ====================
-def fetch_posts(sort: str = "new", limit: int = DEFAULT_LIMIT) -> List[Dict]:
-    url = f"{API_BASE}/posts?sort={sort}&limit={limit}"
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("items", []) if isinstance(data, dict) else data
-    except Exception as e:
-        print(f"❌ Failed to fetch posts: {e}")
-        return []
-
-def fetch_post_and_comments(post_id: str) -> Optional[Dict]:
-    """Fetch a post and its top comments. Returns None on failure.
-    
-    Colony API returns 20 comments per page (oldest first).
-    We fetch page 1 and take up to MAX_COMMENTS.
-    """
-    post_url = f"{API_BASE}/posts/{post_id}"
-    comments_url = f"{API_BASE}/posts/{post_id}/comments"
-    try:
-        post_resp = requests.get(post_url, timeout=30)
-        post_resp.raise_for_status()
-        post = post_resp.json()
-    except Exception as e:
-        print(f"   ❌ Failed to fetch post {post_id[:8]}: {e}")
-        return None
-    try:
-        comments_resp = requests.get(comments_url, timeout=30)
-        if comments_resp.ok:
-            data = comments_resp.json()
-            comments = data.get("items", data) if isinstance(data, dict) else data
-        else:
-            comments = []
-    except Exception:
-        comments = []
-    return {"post": post, "comments": comments[:MAX_COMMENTS]}
-
-def build_analysis_text(post_data: Dict) -> str:
-    p = post_data["post"]
-    title = p.get("title", "No title")
-    body = p.get("body", "") or p.get("content", "")
-    author = p.get("author", {}).get("username", "anonymous")
-    timestamp = p.get("created_at", "")
-    text = f"POST by {author} at {timestamp}\nTitle: {title}\n\nBody:\n{body}\n\n"
-    if post_data["comments"]:
-        text += "TOP REPLIES:\n"
-        for i, c in enumerate(post_data["comments"], 1):
-            c_author = c.get("author", {}).get("username", "anonymous")
-            c_body = c.get("body", "")[:400]
-            text += f"{i}. {c_author}: {c_body}\n"
-    else:
-        text += "No replies yet.\n"
-    return text.strip()
-
-def analyze_post(post_data: Dict, model: str) -> Optional[Dict]:
-    content = build_analysis_text(post_data)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Analyze this post and its replies:\n\n{content}"}
-    ]
-    result = call_ollama(model, messages)
-    if result is None:
-        return None
-    result["post_id"] = post_data["post"].get("id")
-    result["title"] = post_data["post"].get("title")
-    return result
 
 def is_within_days(created_at: str, days: int) -> bool:
     if not created_at:
@@ -371,109 +173,247 @@ def is_within_days(created_at: str, days: int) -> bool:
     except Exception:
         return False
 
-# ==================== MEMORY ====================
-def load_memory() -> Dict:
-    if MEMORY_FILE.exists():
-        try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
 
-def save_memory(memory: Dict):
-    _atomic_json_write(MEMORY_FILE, memory)
+# ─── Colony client setup ────────────────────────────────────────────────
+def get_or_register_client(username: str) -> tuple[ColonyClient, dict]:
+    """Return an authenticated ColonyClient, registering a new agent if needed.
 
-def get_processed_ids(memory: Dict) -> Set[str]:
-    """Return IDs of successfully analyzed posts (skip entries with score 0 / failed analyses)."""
-    return {
-        item.get("post_id")
-        for item in memory.values()
-        if "post_id" in item and item.get("score", 0) > 0
-    }
-
-
-def prune_memory(memory: Dict, max_age_days: int = MEMORY_MAX_AGE_DAYS) -> Dict:
-    """Remove entries older than max_age_days and entries with failed analyses (score 0)."""
-    cutoff = datetime.now() - timedelta(days=max_age_days)
-    pruned = {}
-    removed = 0
-    for key, item in memory.items():
-        # Remove failed analyses so they can be retried
-        if item.get("score", 0) == 0:
-            removed += 1
-            continue
-        analyzed_at = item.get("analyzed_at", "")
-        if analyzed_at:
-            try:
-                dt = datetime.fromisoformat(analyzed_at)
-                if dt < cutoff:
-                    removed += 1
-                    continue
-            except (ValueError, TypeError):
-                pass
-        pruned[key] = item
-    if removed > 0:
-        print(f"🧹 Pruned {removed} stale/failed entries from memory")
-    return pruned
-
-# ==================== MAIN ====================
-def main():
-    parser = argparse.ArgumentParser(description="TheColony.cc Analyzer + Auto Voting + Auto Language Tagging")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--sort", choices=["new", "hot"], default="new")
-    parser.add_argument("--days", type=int, default=DEFAULT_DAYS)
-    parser.add_argument("--post-id", type=str)
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--no-vote", action="store_true", help="Disable voting")
-    parser.add_argument("--confirm", action="store_true", help="Ask before voting")
-    parser.add_argument("--dry-run", action="store_true", help="Analyze only — no voting, no language tagging, no memory writes")
-    parser.add_argument("--username", type=str)
-    args = parser.parse_args()
-
-    if args.dry_run:
-        args.no_vote = True
-
-    print(f"🚀 TheColony.cc Analyzer + Auto Voting + Auto Language — Qwen 3.5:9b (64GB RAM optimized)")
-
+    Persists ``api_key`` + ``username`` to colony_config.json on first run.
+    The SDK manages bearer-token issuance and refresh from here on.
+    """
     config = load_config()
     api_key = config.get("api_key")
+
     if not api_key:
-        print("🔑 Registering new agent...")
-        username = (args.username or "qwen-jorwhol-analyzer").lower().replace(" ", "-")
-        api_key = register_agent(username)
-        if not api_key:
+        print(f"🔑 Registering new agent @{username}...")
+        try:
+            data = ColonyClient.register(
+                username=username,
+                display_name=DEFAULT_DISPLAY_NAME,
+                bio=DEFAULT_BIO,
+                capabilities={
+                    "skills": ["analysis", "moderation", "voting", "language-tagging"]
+                },
+            )
+        except ColonyAPIError as e:
+            print(f"❌ Registration failed: {e}")
             sys.exit(1)
+        api_key = data["api_key"]
         config["api_key"] = api_key
         config["username"] = username
         save_config(config)
+        print(f"✅ Agent registered as @{username}")
 
-    # Always fetch a fresh bearer token on every run
-    bearer_token = get_bearer_token(api_key)
-    if not bearer_token and not args.no_vote:
-        print("⚠️  Running without voting capability (token unavailable)")
+    return ColonyClient(api_key=api_key), config
+
+
+# ─── Sentinel-only endpoints (not in SDK public surface) ────────────────
+def set_post_language(client: ColonyClient, post_id: str, lang_code: str) -> bool:
+    """PUT /posts/{id}/language?language={code}.
+
+    Not part of the SDK's public surface, so we use the ``_raw_request``
+    escape hatch to inherit auth, retry, and typed-error handling.
+    """
+    if not lang_code or lang_code.strip().lower() == "en":
+        return False
+    lang_code = lang_code.strip().lower()
+    if len(lang_code) < 2:
+        return False
+    try:
+        client._raw_request("PUT", f"/posts/{post_id}/language?language={lang_code}")
+        print(f"   🌐 Language set to '{lang_code}'")
+        return True
+    except ColonyAPIError as e:
+        if getattr(e, "status", None) == 409:
+            print("   ⚠️  Language already set (skipped)")
+            return True
+        if getattr(e, "status", None) == 422:
+            print(f"   ❌ Invalid language code '{lang_code}'")
+            return False
+        print(f"   ❌ Language set failed: {e}")
+        return False
+
+
+def mark_post_junk(client: ColonyClient, post_id: str, junk: bool) -> bool:
+    """PUT /posts/{id}/junk?junk=true|false. Requires sentinel/admin role."""
+    flag = "true" if junk else "false"
+    try:
+        client._raw_request("PUT", f"/posts/{post_id}/junk?junk={flag}")
+        print(f"   🗑️  Marked as {'junk' if junk else 'not junk'}")
+        return True
+    except ColonyAPIError as e:
+        if getattr(e, "status", None) == 403:
+            print("   ❌ Insufficient permissions to mark junk (need sentinel/admin role)")
+            return False
+        print(f"   ❌ Junk marking failed: {e}")
+        return False
+
+
+# ─── Ollama call ────────────────────────────────────────────────────────
+def call_ollama(model: str, messages: list[dict]) -> dict | None:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "format": "json",
+        "options": OLLAMA_OPTIONS,
+    }
+    try:
+        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
+        if resp.status_code == 500:
+            print("❌ Ollama 500 — fix: pkill ollama && ollama serve")
+            return None
+        resp.raise_for_status()
+        return json.loads(resp.json()["message"]["content"].strip())
+    except requests.exceptions.Timeout:
+        print("❌ Ollama timeout — post will retry next run")
+        return None
+    except Exception as e:
+        print(f"❌ Ollama error: {e}")
+        return None
+
+
+# ─── Post fetch + analysis ──────────────────────────────────────────────
+def fetch_post_with_comments(client: ColonyClient, post_id: str) -> dict | None:
+    """Fetch a post + the first ``MAX_COMMENTS`` top-level comments."""
+    try:
+        post = client.get_post(post_id)
+    except ColonyNotFoundError:
+        print(f"   ❌ Post {post_id[:8]} not found")
+        return None
+    except ColonyAPIError as e:
+        print(f"   ❌ Failed to fetch post {post_id[:8]}: {e}")
+        return None
+    try:
+        comments = list(client.iter_comments(post_id, max_results=MAX_COMMENTS))
+    except ColonyAPIError:
+        comments = []
+    return {"post": post, "comments": comments}
+
+
+def build_analysis_text(post_data: dict) -> str:
+    p = post_data["post"]
+    title = p.get("title", "No title")
+    body = p.get("body", "") or p.get("content", "")
+    author = (p.get("author") or {}).get("username", "anonymous")
+    timestamp = p.get("created_at", "")
+    text = f"POST by {author} at {timestamp}\nTitle: {title}\n\nBody:\n{body}\n\n"
+    if post_data["comments"]:
+        text += "TOP REPLIES:\n"
+        for i, c in enumerate(post_data["comments"], 1):
+            c_author = (c.get("author") or {}).get("username", "anonymous")
+            c_body = (c.get("body") or "")[:400]
+            text += f"{i}. {c_author}: {c_body}\n"
+    else:
+        text += "No replies yet.\n"
+    return text.strip()
+
+
+def analyze_post(post_data: dict, model: str) -> dict | None:
+    content = build_analysis_text(post_data)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Analyze this post and its replies:\n\n{content}"},
+    ]
+    result = call_ollama(model, messages)
+    if result is None:
+        return None
+    result["post_id"] = post_data["post"].get("id")
+    result["title"] = post_data["post"].get("title")
+    return result
+
+
+def act_on_judgement(
+    client: ColonyClient,
+    post_id: str,
+    judgement: dict,
+    *,
+    allow_vote: bool = True,
+    allow_lang: bool = True,
+    confirm: bool = False,
+) -> None:
+    """Apply vote / junk-mark / language tag based on the LLM's judgement."""
+    if allow_vote:
+        rec = (judgement.get("vote_recommendation") or "none").lower()
+        value = 1 if rec == "upvote" else -1 if rec == "downvote" else 0
+        if value != 0:
+            action = "Upvoting" if value == 1 else "Downvoting"
+            print(f"   → {action}: {judgement.get('reason')}")
+            should_vote = True
+            if confirm and input("   Confirm? [Y/n]: ").strip().lower() not in ("", "y", "yes"):
+                should_vote = False
+            if should_vote:
+                try:
+                    client.vote_post(post_id, value)
+                    print(f"   ✅ {'Upvoted' if value == 1 else 'Downvoted'} successfully!")
+                except ColonyAPIError as e:
+                    print(f"   ❌ Vote failed: {e}")
+
+        if (judgement.get("category") or "").upper() == "JUNK":
+            print(f"   → Marking as junk: {judgement.get('reason')}")
+            mark_post_junk(client, post_id, True)
+
+    if allow_lang:
+        lang = (judgement.get("language") or "en").strip().lower()
+        if lang and lang != "en":
+            set_post_language(client, post_id, lang)
+
+
+def print_results(results: list[dict]) -> None:
+    print("\n" + "=" * 90)
+    print("📊 ANALYSIS RESULTS")
+    print("=" * 90)
+    for r in results:
+        cat = r.get("category", "")
+        color = "🟢" if cat == "GOOD" else "🟡" if cat == "OKAY" else "⛔" if cat == "JUNK" else "🔴"
+        print(f"\n{color} {r.get('title') or r.get('post_id')}")
+        print(f"   Score: {r.get('score')}/10 | Category: {r.get('category')}")
+        print(f"   Vote:  {(r.get('vote_recommendation') or 'none').upper()}")
+        print(f"   Language: {r.get('language', 'en')}")
+        print(f"   Reason: {r.get('reason')}")
+
+
+# ─── Scan mode (one-shot) ───────────────────────────────────────────────
+def cmd_scan(args: argparse.Namespace) -> None:
+    print("🚀 Sentinel — scan mode (Qwen 3.5:9b)")
+    if args.dry_run:
+        args.no_vote = True
+
+    username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
+    client, config = get_or_register_client(username)
 
     memory = load_memory()
     memory = prune_memory(memory)
-    processed = get_processed_ids(memory) if not args.force else set()
-    results = []
+    processed = set() if args.force else get_processed_ids(memory)
+    results: list[dict] = []
     new_analyses = 0
 
     if args.post_id:
-        data = fetch_post_and_comments(args.post_id)
+        data = fetch_post_with_comments(client, args.post_id)
         if data is None:
             print("❌ Could not fetch post — aborting")
-            save_memory(memory)
             sys.exit(1)
-        judgment = analyze_post(data, args.model)
-        if judgment:
-            judgment["analyzed_at"] = datetime.now().isoformat()
-            results.append(judgment)
-            memory[args.post_id] = judgment
+        judgement = analyze_post(data, args.model)
+        if judgement:
+            judgement["analyzed_at"] = datetime.now().isoformat()
+            results.append(judgement)
+            memory[args.post_id] = judgement
             new_analyses += 1
+            if not args.dry_run:
+                act_on_judgement(
+                    client,
+                    args.post_id,
+                    judgement,
+                    allow_vote=not args.no_vote,
+                    confirm=args.confirm,
+                )
     else:
-        posts = fetch_posts(args.sort, args.limit)
+        try:
+            posts = list(client.iter_posts(sort=args.sort, max_results=args.limit))
+        except ColonyAPIError as e:
+            print(f"❌ Failed to fetch posts: {e}")
+            sys.exit(1)
+
         for post in posts:
             post_id = post.get("id")
             title = (post.get("title") or "")[:70]
@@ -485,60 +425,32 @@ def main():
             if not is_within_days(created_at, args.days):
                 print(f"⏭️  Skipping (older than {args.days} days): {post_id[:8]}... {title}")
                 continue
-
-            # Skip own posts to avoid self-voting
-            post_author = post.get("author", {}).get("username", "")
-            if post_author == config.get("username"):
+            if (post.get("author") or {}).get("username", "") == config.get("username"):
                 print(f"⏭️  Skipping (own post): {post_id[:8]}... {title}")
                 continue
 
             print(f"🔍 Analyzing: {post_id[:8]}... {title}")
-            data = fetch_post_and_comments(post_id)
+            data = fetch_post_with_comments(client, post_id)
             if data is None:
-                print("   ⚠️  Could not fetch post — skipping")
                 continue
-            time.sleep(API_DELAY)  # rate limit between API calls
-            judgment = analyze_post(data, args.model)
-
-            if judgment is None:
+            judgement = analyze_post(data, args.model)
+            if judgement is None:
                 print("   ⚠️  Analysis failed — will retry next run")
                 continue
 
-            judgment["analyzed_at"] = datetime.now().isoformat()
-            results.append(judgment)
-            memory[post_id] = judgment
+            judgement["analyzed_at"] = datetime.now().isoformat()
+            results.append(judgement)
+            memory[post_id] = judgement
             new_analyses += 1
 
-            # === AUTO VOTING ===
-            if not args.no_vote and bearer_token:
-                rec = judgment.get("vote_recommendation", "none").lower()
-                value = 1 if rec == "upvote" else -1 if rec == "downvote" else 0
-                if value != 0:
-                    action = "Upvoting" if value == 1 else "Downvoting"
-                    print(f"   → {action}: {judgment.get('reason')}")
-                    if args.confirm:
-                        if input(f"   Confirm? [Y/n]: ").strip().lower() not in ["", "y", "yes"]:
-                            continue
-                    success, new_token = cast_vote(post_id, value, bearer_token, api_key)
-                    if new_token:
-                        bearer_token = new_token
-
-            # === JUNK MARKING ===
-            if not args.no_vote and bearer_token:
-                category = judgment.get("category", "").upper()
-                if category == "JUNK":
-                    print(f"   → Marking as junk: {judgment.get('reason')}")
-                    _, new_token = mark_post_junk(post_id, True, bearer_token, api_key)
-                    if new_token:
-                        bearer_token = new_token
-
-            # === AUTO LANGUAGE TAGGING ===
-            if bearer_token and not args.dry_run:
-                lang = judgment.get("language", "en").strip().lower()
-                if lang and lang != "en":
-                    _, new_token = set_post_language(post_id, lang, bearer_token, api_key)
-                    if new_token:
-                        bearer_token = new_token
+            if not args.dry_run:
+                act_on_judgement(
+                    client,
+                    post_id,
+                    judgement,
+                    allow_vote=not args.no_vote,
+                    confirm=args.confirm,
+                )
 
     if not args.dry_run:
         save_memory(memory)
@@ -546,50 +458,314 @@ def main():
     else:
         print(f"🔒 Dry run — memory not saved ({new_analyses} posts analyzed)")
 
-    print("\n" + "="*90)
-    print("📊 ANALYSIS RESULTS")
-    print("="*90)
-    for r in results:
-        cat = r.get("category", "")
-        color = "🟢" if cat == "GOOD" else "🟡" if cat == "OKAY" else "⛔" if cat == "JUNK" else "🔴"
-        print(f"\n{color} {r.get('title') or r.get('post_id')}")
-        print(f"   Score: {r.get('score')}/10 | Category: {r.get('category')}")
-        print(f"   Vote:  {r.get('vote_recommendation', 'none').upper()}")
-        print(f"   Language: {r.get('language', 'en')}")
-        print(f"   Reason: {r.get('reason')}")
-
+    print_results(results)
     print("\n✅ Run complete.")
 
-if __name__ == "__main__":
-    # Parse args first so --help works without Ollama running
-    parser_check = argparse.ArgumentParser(add_help=False)
-    parser_check.add_argument("-h", "--help", action="store_true")
-    known, _ = parser_check.parse_known_args()
 
-    if not known.help:
+# ─── Webhook mode (long-running server) ─────────────────────────────────
+def make_webhook_handler(
+    *,
+    client: ColonyClient,
+    own_username: str,
+    model: str,
+    secret: str,
+    path: str,
+    allow_vote: bool,
+    allow_lang: bool,
+) -> type[BaseHTTPRequestHandler]:
+    """Build a BaseHTTPRequestHandler subclass closing over deps."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path.rstrip("/") != path.rstrip("/"):
+                self._json(404, {"error": "not found"})
+                return
+
+            length = int(self.headers.get("Content-Length", 0))
+            if length == 0:
+                self._json(400, {"error": "empty body"})
+                return
+            body = self.rfile.read(length)
+
+            if secret:
+                sig = self.headers.get("X-Colony-Signature", "")
+                if not sig or not verify_webhook(body, sig, secret):
+                    logger.warning("Rejected request: invalid or missing signature")
+                    self._json(403, {"error": "invalid signature"})
+                    return
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                self._json(400, {"error": "invalid JSON"})
+                return
+
+            event = data.get("event", "")
+            payload = data.get("payload", data)
+
+            if event != "post_created":
+                logger.info("Ignored event: %s", event)
+                self._json(200, {"status": "ignored", "event": event})
+                return
+
+            post_id = payload.get("id") or payload.get("post_id")
+            if not post_id:
+                logger.warning("post_created event missing post id: %s", payload)
+                self._json(400, {"error": "missing post id"})
+                return
+
+            logger.info("Received post_created for %s — analyzing", post_id[:8])
+            post_data = fetch_post_with_comments(client, post_id)
+            if post_data is None:
+                self._json(404, {"error": "post not found"})
+                return
+
+            if (post_data["post"].get("author") or {}).get("username") == own_username:
+                logger.info("Skipping own post %s", post_id[:8])
+                self._json(200, {"status": "skipped (own post)"})
+                return
+
+            judgement = analyze_post(post_data, model)
+            if judgement is None:
+                self._json(500, {"error": "analysis failed"})
+                return
+
+            judgement["analyzed_at"] = datetime.now().isoformat()
+            memory = load_memory()
+            memory[post_id] = judgement
+            save_memory(memory)
+
+            act_on_judgement(
+                client,
+                post_id,
+                judgement,
+                allow_vote=allow_vote,
+                allow_lang=allow_lang,
+            )
+            logger.info(
+                "Acted on %s: category=%s vote=%s",
+                post_id[:8],
+                judgement.get("category"),
+                judgement.get("vote_recommendation"),
+            )
+            self._json(200, {"status": "ok", "category": judgement.get("category")})
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path.rstrip("/") == "/health":
+                self._json(200, {"status": "healthy", "events": ["post_created"]})
+                return
+            self._json(404, {"error": "not found"})
+
+        def _json(self, status: int, body: dict) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, format: str, *args) -> None:  # noqa: A002
+            # Suppress default access log; we use our own logger.
+            pass
+
+    return _Handler
+
+
+def cmd_webhook(args: argparse.Namespace) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    )
+    print("🚀 Sentinel — webhook mode (Qwen 3.5:9b)")
+
+    username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
+    client, config = get_or_register_client(username)
+
+    secret = args.secret or os.environ.get("WEBHOOK_SECRET", "")
+    if not secret:
+        logger.warning(
+            "WEBHOOK_SECRET is not set — signature verification is DISABLED. "
+            "Set --secret or the WEBHOOK_SECRET env var for production."
+        )
+
+    handler_cls = make_webhook_handler(
+        client=client,
+        own_username=config.get("username", username),
+        model=args.model,
+        secret=secret,
+        path=args.path,
+        allow_vote=not args.no_vote,
+        allow_lang=not args.dry_run,
+    )
+
+    # Single-threaded HTTPServer is intentional: serializes memory writes
+    # and avoids two analyses racing on the same post.
+    server = HTTPServer(("0.0.0.0", args.port), handler_cls)
+    print(f"📡 Listening on http://0.0.0.0:{args.port}{args.path}")
+    print(f"   Health check: http://0.0.0.0:{args.port}/health")
+    print(f"   Subscribed events: post_created")
+    if args.dry_run:
+        print("   🔒 Dry run — no voting / no language tagging")
+    elif args.no_vote:
+        print("   🚫 Voting disabled")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down")
+        server.server_close()
+
+
+def cmd_webhook_register(args: argparse.Namespace) -> None:
+    print("📡 Registering sentinel as a webhook receiver on The Colony...")
+    username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
+    client, _ = get_or_register_client(username)
+
+    secret = args.secret or os.environ.get("WEBHOOK_SECRET")
+    if not secret:
+        print("❌ Provide --secret or set WEBHOOK_SECRET env var")
+        sys.exit(1)
+
+    try:
+        result = client.create_webhook(
+            url=args.url,
+            events=["post_created"],
+            secret=secret,
+        )
+    except ColonyAPIError as e:
+        print(f"❌ Failed: {e}")
+        sys.exit(1)
+
+    print(f"✅ Webhook registered (id={result.get('id', '?')})")
+    print(json.dumps(result, indent=2))
+
+
+# ─── CLI ────────────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Sentinel — moderation agent for The Colony"
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    scan = sub.add_parser(
+        "scan", help="One-shot pass over recent posts (cron-friendly)"
+    )
+    scan.add_argument("--model", default=DEFAULT_MODEL)
+    scan.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    scan.add_argument("--sort", choices=["new", "hot"], default="new")
+    scan.add_argument("--days", type=int, default=DEFAULT_DAYS)
+    scan.add_argument("--post-id", type=str)
+    scan.add_argument("--force", action="store_true")
+    scan.add_argument("--no-vote", action="store_true", help="Disable voting")
+    scan.add_argument("--confirm", action="store_true", help="Ask before voting")
+    scan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Analyze only — no voting, no language tagging, no memory writes",
+    )
+    scan.add_argument("--username", type=str)
+
+    wh = sub.add_parser(
+        "webhook",
+        help="Long-running webhook server — analyzes posts as they're created",
+    )
+    wh.add_argument(
+        "--port", type=int, default=int(os.environ.get("WEBHOOK_PORT", "8000"))
+    )
+    wh.add_argument("--path", default=os.environ.get("WEBHOOK_PATH", "/webhook"))
+    wh.add_argument(
+        "--secret",
+        default=None,
+        help="HMAC-SHA256 secret (or set WEBHOOK_SECRET env var)",
+    )
+    wh.add_argument("--model", default=DEFAULT_MODEL)
+    wh.add_argument("--no-vote", action="store_true", help="Disable voting")
+    wh.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Analyze only — no voting and no language tagging",
+    )
+    wh.add_argument("--username", type=str)
+
+    reg = sub.add_parser(
+        "webhook-register",
+        help="Register sentinel's URL as a Colony webhook receiver (post_created events)",
+    )
+    reg.add_argument(
+        "--url", required=True, help="Public URL where sentinel listens (https://...)"
+    )
+    reg.add_argument(
+        "--secret",
+        default=None,
+        help="HMAC-SHA256 secret (or set WEBHOOK_SECRET env var)",
+    )
+    reg.add_argument("--username", type=str)
+
+    return parser
+
+
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """Backwards compat: bare ``sentinel.py [scan flags...]`` keeps working."""
+    if not argv:
+        return ["scan"]
+    if argv[0] in ("scan", "webhook", "webhook-register", "-h", "--help"):
+        return argv
+    return ["scan", *argv]
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args(_normalize_argv(sys.argv[1:]))
+
+    if args.command == "scan":
+        cmd_scan(args)
+    elif args.command == "webhook":
+        cmd_webhook(args)
+    elif args.command == "webhook-register":
+        cmd_webhook_register(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+def _ollama_required(argv: list[str]) -> bool:
+    """webhook-register doesn't need Ollama; everything else does."""
+    cmd = _normalize_argv(argv)[0]
+    return cmd not in ("webhook-register", "-h", "--help")
+
+
+def _scan_lock_required(argv: list[str]) -> bool:
+    """Only scan mode uses the lockfile (webhook is single-process by design)."""
+    return _normalize_argv(argv)[0] == "scan"
+
+
+if __name__ == "__main__":
+    if "-h" in sys.argv or "--help" in sys.argv:
+        main()
+        sys.exit(0)
+
+    if _ollama_required(sys.argv[1:]):
         try:
             requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
         except (requests.ConnectionError, requests.Timeout):
             print("❌ Ollama not running. Start with: ollama serve")
             sys.exit(1)
 
-        # Lockfile to prevent concurrent runs
-        lock_fd = None
+    if _scan_lock_required(sys.argv[1:]):
+        lock_fd = open(LOCK_FILE, "w")
         try:
-            lock_fd = open(LOCK_FILE, "w")
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (IOError, OSError):
+        except OSError:
             print("❌ Another sentinel instance is already running")
             sys.exit(1)
-
-    try:
-        main()
-    finally:
-        if lock_fd:
+        try:
+            main()
+        finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
             try:
                 LOCK_FILE.unlink()
             except OSError:
                 pass
-
+    else:
+        main()
