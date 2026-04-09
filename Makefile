@@ -13,7 +13,7 @@ setup:
 	@echo "🔧 Setting up virtual environment..."
 	@test -d $(VENV_DIR) || python3 -m venv $(VENV_DIR)
 	@$(PIP) install --upgrade pip
-	@$(PIP) install -r requirements.txt
+	@$(PIP) install --upgrade -r requirements.txt
 	@echo "✅ Virtual environment ready"
 
 .PHONY: run
