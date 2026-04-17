@@ -21,11 +21,14 @@ import fcntl
 import json
 import logging
 import os
+import queue
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 import requests  # only used for the local Ollama call
 
@@ -47,6 +50,14 @@ CONFIG_FILE = Path("colony_config.json")
 DEFAULT_DAYS = 7
 OLLAMA_TIMEOUT = 600
 MEMORY_MAX_AGE_DAYS = 90
+
+# Webhook mode: process events in a background worker so the HTTP response
+# returns immediately. Keeps the public endpoint responsive when Ollama is
+# slow, and prevents The Colony from marking delivery as failed + retrying.
+WEBHOOK_QUEUE_SIZE = 100
+# Prune memory every N processed posts in webhook mode (scan mode prunes on
+# every run).
+WEBHOOK_PRUNE_EVERY = 50
 
 DEFAULT_USERNAME = "qwen-jorwhol-analyzer"
 DEFAULT_DISPLAY_NAME = "Qwen 3.5 Jorwhol Analyzer"
@@ -92,6 +103,36 @@ Output ONLY valid JSON in this exact format (no extra text):
 """
 
 logger = logging.getLogger("sentinel")
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Single entry point for logger config.
+
+    Scan and webhook both go through here so systemd/journald/log-file
+    capture works consistently. Called once from ``main``; idempotent.
+    """
+    root = logging.getLogger()
+    if root.handlers:  # already configured
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s")
+    )
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
+def _sdk_raw(client: ColonyClient, method: str, path: str) -> Any:
+    """Thin wrapper around ``colony-sdk``'s internal ``_raw_request``.
+
+    Several sentinel-only endpoints (junk, pii, language) are not yet in the
+    SDK's public surface, so we reach into ``_raw_request`` to inherit auth,
+    retry, and typed-error handling. This is a private SDK method — a 2.x
+    release could rename or remove it. ``requirements.txt`` pins the SDK to
+    ``<2`` to guard against that. Keeping every call site routed through this
+    helper means there's one place to adapt if the SDK API moves.
+    """
+    return client._raw_request(method, path)
 
 
 # ─── Atomic JSON persistence ────────────────────────────────────────────
@@ -165,7 +206,7 @@ def prune_memory(memory: dict, max_age_days: int = MEMORY_MAX_AGE_DAYS) -> dict:
                 pass
         pruned[key] = item
     if removed:
-        print(f"🧹 Pruned {removed} stale/failed entries from memory")
+        logger.info("Pruned %d stale/failed entries from memory", removed)
     return pruned
 
 
@@ -191,7 +232,7 @@ def get_or_register_client(username: str) -> tuple[ColonyClient, dict]:
     api_key = config.get("api_key")
 
     if not api_key:
-        print(f"🔑 Registering new agent @{username}...")
+        logger.info("Registering new agent @%s", username)
         try:
             data = ColonyClient.register(
                 username=username,
@@ -202,41 +243,37 @@ def get_or_register_client(username: str) -> tuple[ColonyClient, dict]:
                 },
             )
         except ColonyAPIError as e:
-            print(f"❌ Registration failed: {e}")
+            logger.error("Registration failed: %s", e)
             sys.exit(1)
         api_key = data["api_key"]
         config["api_key"] = api_key
         config["username"] = username
         save_config(config)
-        print(f"✅ Agent registered as @{username}")
+        logger.info("Agent registered as @%s", username)
 
     return ColonyClient(api_key=api_key), config
 
 
 # ─── Sentinel-only endpoints (not in SDK public surface) ────────────────
 def set_post_language(client: ColonyClient, post_id: str, lang_code: str) -> bool:
-    """PUT /posts/{id}/language?language={code}.
-
-    Not part of the SDK's public surface, so we use the ``_raw_request``
-    escape hatch to inherit auth, retry, and typed-error handling.
-    """
+    """PUT /posts/{id}/language?language={code}."""
     if not lang_code or lang_code.strip().lower() == "en":
         return False
     lang_code = lang_code.strip().lower()
     if len(lang_code) < 2:
         return False
     try:
-        client._raw_request("PUT", f"/posts/{post_id}/language?language={lang_code}")
-        print(f"   🌐 Language set to '{lang_code}'")
+        _sdk_raw(client, "PUT", f"/posts/{post_id}/language?language={lang_code}")
+        logger.info("Language set to '%s' on post %s", lang_code, post_id[:8])
         return True
     except ColonyAPIError as e:
         if getattr(e, "status", None) == 409:
-            print("   ⚠️  Language already set (skipped)")
+            logger.info("Language already set on post %s (skipped)", post_id[:8])
             return True
         if getattr(e, "status", None) == 422:
-            print(f"   ❌ Invalid language code '{lang_code}'")
+            logger.warning("Invalid language code '%s' for post %s", lang_code, post_id[:8])
             return False
-        print(f"   ❌ Language set failed: {e}")
+        logger.warning("Language set failed for post %s: %s", post_id[:8], e)
         return False
 
 
@@ -244,14 +281,14 @@ def mark_post_junk(client: ColonyClient, post_id: str, junk: bool) -> bool:
     """PUT /posts/{id}/junk?junk=true|false. Requires sentinel/admin role."""
     flag = "true" if junk else "false"
     try:
-        client._raw_request("PUT", f"/posts/{post_id}/junk?junk={flag}")
-        print(f"   🗑️  Marked as {'junk' if junk else 'not junk'}")
+        _sdk_raw(client, "PUT", f"/posts/{post_id}/junk?junk={flag}")
+        logger.info("Post %s marked as %s", post_id[:8], "junk" if junk else "not junk")
         return True
     except ColonyAPIError as e:
         if getattr(e, "status", None) == 403:
-            print("   ❌ Insufficient permissions to mark junk (need sentinel/admin role)")
+            logger.error("Insufficient permissions to mark junk (need sentinel/admin role)")
             return False
-        print(f"   ❌ Junk marking failed: {e}")
+        logger.warning("Junk marking failed for post %s: %s", post_id[:8], e)
         return False
 
 
@@ -259,14 +296,14 @@ def flag_post_pii(client: ColonyClient, post_id: str, has_pii: bool) -> bool:
     """PUT /posts/{id}/pii?has_pii=true|false. Requires sentinel role."""
     flag = "true" if has_pii else "false"
     try:
-        client._raw_request("PUT", f"/posts/{post_id}/pii?has_pii={flag}")
-        print(f"   🕵️  Post PII flag set to {has_pii}")
+        _sdk_raw(client, "PUT", f"/posts/{post_id}/pii?has_pii={flag}")
+        logger.info("Post %s PII flag set to %s", post_id[:8], has_pii)
         return True
     except ColonyAPIError as e:
         if getattr(e, "status", None) == 403:
-            print("   ❌ Insufficient permissions to flag PII (need sentinel role)")
+            logger.error("Insufficient permissions to flag PII (need sentinel role)")
             return False
-        print(f"   ❌ PII flag failed: {e}")
+        logger.warning("PII flag failed for post %s: %s", post_id[:8], e)
         return False
 
 
@@ -274,14 +311,14 @@ def flag_comment_pii(client: ColonyClient, comment_id: str, has_pii: bool) -> bo
     """PUT /comments/{id}/pii?has_pii=true|false. Requires sentinel role."""
     flag = "true" if has_pii else "false"
     try:
-        client._raw_request("PUT", f"/comments/{comment_id}/pii?has_pii={flag}")
-        print(f"   🕵️  Comment {comment_id[:8]} PII flag set to {has_pii}")
+        _sdk_raw(client, "PUT", f"/comments/{comment_id}/pii?has_pii={flag}")
+        logger.info("Comment %s PII flag set to %s", comment_id[:8], has_pii)
         return True
     except ColonyAPIError as e:
         if getattr(e, "status", None) == 403:
-            print("   ❌ Insufficient permissions to flag PII (need sentinel role)")
+            logger.error("Insufficient permissions to flag PII (need sentinel role)")
             return False
-        print(f"   ❌ PII flag failed: {e}")
+        logger.warning("PII flag failed for comment %s: %s", comment_id[:8], e)
         return False
 
 
@@ -297,15 +334,15 @@ def call_ollama(model: str, messages: list[dict]) -> dict | None:
     try:
         resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
         if resp.status_code == 500:
-            print("❌ Ollama 500 — fix: pkill ollama && ollama serve")
+            logger.error("Ollama 500 — try: pkill ollama && ollama serve")
             return None
         resp.raise_for_status()
         return json.loads(resp.json()["message"]["content"].strip())
     except requests.exceptions.Timeout:
-        print("❌ Ollama timeout — post will retry next run")
+        logger.warning("Ollama timeout — post will retry next run")
         return None
     except Exception as e:
-        print(f"❌ Ollama error: {e}")
+        logger.error("Ollama error: %s", e)
         return None
 
 
@@ -315,10 +352,10 @@ def fetch_post_with_comments(client: ColonyClient, post_id: str) -> dict | None:
     try:
         post = client.get_post(post_id)
     except ColonyNotFoundError:
-        print(f"   ❌ Post {post_id[:8]} not found")
+        logger.warning("Post %s not found", post_id[:8])
         return None
     except ColonyAPIError as e:
-        print(f"   ❌ Failed to fetch post {post_id[:8]}: {e}")
+        logger.warning("Failed to fetch post %s: %s", post_id[:8], e)
         return None
     try:
         comments = list(client.iter_comments(post_id, max_results=MAX_COMMENTS))
@@ -362,6 +399,77 @@ def analyze_post(post_data: dict, model: str) -> dict | None:
     return result
 
 
+def _pending_actions(judgement: dict) -> list[dict]:
+    """Translate a judgement into a list of action dicts.
+
+    Each dict is self-describing — ``{"kind": "vote", "value": 1}`` etc.
+    This is the canonical format used for both the initial apply pass and
+    for storing failures in memory for later retry, so a judgement from a
+    previous run can be replayed without needing the LLM again.
+    """
+    actions: list[dict] = []
+
+    rec = (judgement.get("vote_recommendation") or "none").lower()
+    value = 1 if rec == "upvote" else -1 if rec == "downvote" else 0
+    if value != 0:
+        actions.append({"kind": "vote", "value": value})
+
+    if (judgement.get("category") or "").upper() == "JUNK":
+        actions.append({"kind": "junk"})
+
+    lang = (judgement.get("language") or "en").strip().lower()
+    if lang and lang != "en":
+        actions.append({"kind": "language", "code": lang})
+
+    if judgement.get("post_has_pii") is True:
+        actions.append({"kind": "post_pii"})
+
+    comment_ids = judgement.get("_comment_ids") or []
+    for idx in judgement.get("pii_comment_indices") or []:
+        try:
+            pos = int(idx) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= pos < len(comment_ids) and comment_ids[pos]:
+            actions.append({"kind": "comment_pii", "comment_id": comment_ids[pos]})
+
+    return actions
+
+
+def _apply_action(client: ColonyClient, post_id: str, action: dict) -> bool:
+    """Apply a single action. Returns True on success, False on failure.
+
+    Isolated so retries can replay an action from memory without reshaping
+    the judgement dict.
+    """
+    kind = action.get("kind")
+    if kind == "vote":
+        try:
+            client.vote_post(post_id, int(action["value"]))
+            logger.info(
+                "Voted %s on post %s",
+                "+1" if int(action["value"]) > 0 else "-1",
+                post_id[:8],
+            )
+            return True
+        except ColonyAPIError as e:
+            logger.warning("Vote failed for post %s: %s", post_id[:8], e)
+            return False
+    if kind == "junk":
+        return mark_post_junk(client, post_id, True)
+    if kind == "language":
+        return set_post_language(client, post_id, str(action.get("code", "")))
+    if kind == "post_pii":
+        return flag_post_pii(client, post_id, True)
+    if kind == "comment_pii":
+        cid = action.get("comment_id")
+        if not cid:
+            return False
+        return flag_comment_pii(client, str(cid), True)
+    logger.warning("Unknown action kind: %s", kind)
+    return False
+
+
 def act_on_judgement(
     client: ColonyClient,
     post_id: str,
@@ -371,71 +479,110 @@ def act_on_judgement(
     allow_lang: bool = True,
     allow_pii: bool = True,
     confirm: bool = False,
-) -> None:
-    """Apply vote / junk-mark / language tag / PII flag based on the LLM's judgement."""
-    if allow_vote:
-        rec = (judgement.get("vote_recommendation") or "none").lower()
-        value = 1 if rec == "upvote" else -1 if rec == "downvote" else 0
-        if value != 0:
-            action = "Upvoting" if value == 1 else "Downvoting"
-            print(f"   → {action}: {judgement.get('reason')}")
-            should_vote = True
-            if confirm and input("   Confirm? [Y/n]: ").strip().lower() not in ("", "y", "yes"):
-                should_vote = False
-            if should_vote:
-                try:
-                    client.vote_post(post_id, value)
-                    print(f"   ✅ {'Upvoted' if value == 1 else 'Downvoted'} successfully!")
-                except ColonyAPIError as e:
-                    print(f"   ❌ Vote failed: {e}")
+) -> list[dict]:
+    """Apply all actions derived from a judgement.
 
-        if (judgement.get("category") or "").upper() == "JUNK":
-            print(f"   → Marking as junk: {judgement.get('reason')}")
-            mark_post_junk(client, post_id, True)
+    Returns the list of actions that FAILED, so the caller can persist them
+    to memory for retry on the next run. An empty list means everything
+    succeeded (or nothing was needed).
+    """
+    actions = _pending_actions(judgement)
+    allowed: list[dict] = []
+    for a in actions:
+        kind = a["kind"]
+        if kind == "vote" and not allow_vote:
+            continue
+        if kind == "junk" and not allow_vote:
+            # Junk-marking is gated by --no-vote (both are moderation actions).
+            continue
+        if kind == "language" and not allow_lang:
+            continue
+        if kind in ("post_pii", "comment_pii") and not allow_pii:
+            continue
+        allowed.append(a)
 
-    if allow_lang:
-        lang = (judgement.get("language") or "en").strip().lower()
-        if lang and lang != "en":
-            set_post_language(client, post_id, lang)
+    if confirm:
+        # Only interactive voting prompts for confirmation (historical behavior).
+        for a in allowed:
+            if a["kind"] == "vote":
+                action_label = "Upvote" if a["value"] > 0 else "Downvote"
+                reply = input(f"   {action_label} — reason: {judgement.get('reason')} — confirm? [Y/n]: ").strip().lower()
+                if reply not in ("", "y", "yes"):
+                    a["_skipped"] = True
 
-    if allow_pii:
-        if judgement.get("post_has_pii") is True:
-            print(f"   → Flagging post PII: {judgement.get('reason')}")
-            flag_post_pii(client, post_id, True)
-
-        comment_ids = judgement.get("_comment_ids") or []
-        for idx in judgement.get("pii_comment_indices") or []:
-            try:
-                # LLM is told to use 1-based indexing matching the "TOP REPLIES" list
-                pos = int(idx) - 1
-            except (TypeError, ValueError):
-                continue
-            if 0 <= pos < len(comment_ids) and comment_ids[pos]:
-                flag_comment_pii(client, comment_ids[pos], True)
+    failed: list[dict] = []
+    for a in allowed:
+        if a.get("_skipped"):
+            continue
+        ok = _apply_action(client, post_id, a)
+        if not ok:
+            failed.append(a)
+    return failed
 
 
-def print_results(results: list[dict]) -> None:
-    print("\n" + "=" * 90)
-    print("📊 ANALYSIS RESULTS")
-    print("=" * 90)
+def retry_pending_actions(client: ColonyClient, memory: dict) -> int:
+    """Replay pending actions saved from earlier runs.
+
+    Called once at scan startup and once when the webhook worker starts.
+    Entries whose retries all succeed get ``_pending_actions`` cleared;
+    persistent failures stay in memory with an incremented attempt count
+    until they exceed a small ceiling, at which point they're dropped
+    (e.g. a post that was deleted between runs).
+    """
+    retried = 0
+    for post_id, entry in list(memory.items()):
+        pending = entry.get("_pending_actions") or []
+        if not pending:
+            continue
+        attempts = int(entry.get("_pending_attempts", 0)) + 1
+        if attempts > 5:
+            logger.warning("Dropping %d pending actions for post %s after 5 attempts", len(pending), post_id[:8])
+            entry.pop("_pending_actions", None)
+            entry.pop("_pending_attempts", None)
+            continue
+        logger.info("Retrying %d pending actions for post %s (attempt %d)", len(pending), post_id[:8], attempts)
+        still_failed: list[dict] = []
+        for a in pending:
+            if _apply_action(client, post_id, a):
+                retried += 1
+            else:
+                still_failed.append(a)
+        if still_failed:
+            entry["_pending_actions"] = still_failed
+            entry["_pending_attempts"] = attempts
+        else:
+            entry.pop("_pending_actions", None)
+            entry.pop("_pending_attempts", None)
+    return retried
+
+
+def log_results(results: list[dict]) -> None:
+    """Emit a per-post analysis summary via the logger."""
+    if not results:
+        return
+    logger.info("── Analysis summary (%d posts) ──", len(results))
     for r in results:
-        cat = r.get("category", "")
-        color = "🟢" if cat == "GOOD" else "🟡" if cat == "OKAY" else "⛔" if cat == "JUNK" else "🔴"
-        print(f"\n{color} {r.get('title') or r.get('post_id')}")
-        print(f"   Score: {r.get('score')}/10 | Category: {r.get('category')}")
-        print(f"   Vote:  {(r.get('vote_recommendation') or 'none').upper()}")
-        print(f"   Language: {r.get('language', 'en')}")
+        pii_suffix = ""
         if r.get("post_has_pii"):
-            print("   🕵️  Post flagged for PII")
+            pii_suffix += " [post-PII]"
         pii_idx = r.get("pii_comment_indices") or []
         if pii_idx:
-            print(f"   🕵️  Comments flagged for PII: {pii_idx}")
-        print(f"   Reason: {r.get('reason')}")
+            pii_suffix += f" [comment-PII={pii_idx}]"
+        logger.info(
+            "%s score=%s vote=%s lang=%s%s — %s (%s)",
+            r.get("category"),
+            r.get("score"),
+            (r.get("vote_recommendation") or "none").upper(),
+            r.get("language", "en"),
+            pii_suffix,
+            r.get("title") or r.get("post_id"),
+            r.get("reason"),
+        )
 
 
 # ─── Scan mode (one-shot) ───────────────────────────────────────────────
 def cmd_scan(args: argparse.Namespace) -> None:
-    print("🚀 Sentinel — scan mode (Qwen 3.5:9b)")
+    logger.info("Sentinel — scan mode")
     if args.dry_run:
         args.no_vote = True
         args.no_pii = True
@@ -445,6 +592,13 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
     memory = load_memory()
     memory = prune_memory(memory)
+
+    # Replay any actions that failed on a previous run before analyzing new posts.
+    if not args.dry_run:
+        retried = retry_pending_actions(client, memory)
+        if retried:
+            logger.info("Replayed %d pending actions from previous runs", retried)
+
     processed = set() if args.force else get_processed_ids(memory)
     results: list[dict] = []
     new_analyses = 0
@@ -452,7 +606,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     if args.post_id:
         data = fetch_post_with_comments(client, args.post_id)
         if data is None:
-            print("❌ Could not fetch post — aborting")
+            logger.error("Could not fetch post — aborting")
             sys.exit(1)
         judgement = analyze_post(data, args.model)
         if judgement:
@@ -461,7 +615,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
             memory[args.post_id] = judgement
             new_analyses += 1
             if not args.dry_run:
-                act_on_judgement(
+                failed = act_on_judgement(
                     client,
                     args.post_id,
                     judgement,
@@ -469,11 +623,13 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     allow_pii=not args.no_pii,
                     confirm=args.confirm,
                 )
+                if failed:
+                    judgement["_pending_actions"] = failed
     else:
         try:
             posts = list(client.iter_posts(sort=args.sort, max_results=args.limit))
         except ColonyAPIError as e:
-            print(f"❌ Failed to fetch posts: {e}")
+            logger.error("Failed to fetch posts: %s", e)
             sys.exit(1)
 
         for post in posts:
@@ -481,23 +637,25 @@ def cmd_scan(args: argparse.Namespace) -> None:
             title = (post.get("title") or "")[:70]
             created_at = post.get("created_at")
 
-            if post_id in processed and not args.force:
-                print(f"⏭️  Skipping (already analyzed): {post_id[:8]}... {title}")
+            if not post_id:
                 continue
-            if not is_within_days(created_at, args.days):
-                print(f"⏭️  Skipping (older than {args.days} days): {post_id[:8]}... {title}")
+            if post_id in processed and not args.force:
+                logger.debug("Skipping (already analyzed): %s %s", post_id[:8], title)
+                continue
+            if not is_within_days(created_at or "", args.days):
+                logger.debug("Skipping (older than %d days): %s %s", args.days, post_id[:8], title)
                 continue
             if (post.get("author") or {}).get("username", "") == config.get("username"):
-                print(f"⏭️  Skipping (own post): {post_id[:8]}... {title}")
+                logger.debug("Skipping (own post): %s %s", post_id[:8], title)
                 continue
 
-            print(f"🔍 Analyzing: {post_id[:8]}... {title}")
+            logger.info("Analyzing %s: %s", post_id[:8], title)
             data = fetch_post_with_comments(client, post_id)
             if data is None:
                 continue
             judgement = analyze_post(data, args.model)
             if judgement is None:
-                print("   ⚠️  Analysis failed — will retry next run")
+                logger.warning("Analysis failed — will retry next run")
                 continue
 
             judgement["analyzed_at"] = datetime.now().isoformat()
@@ -506,7 +664,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
             new_analyses += 1
 
             if not args.dry_run:
-                act_on_judgement(
+                failed = act_on_judgement(
                     client,
                     post_id,
                     judgement,
@@ -514,28 +672,177 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     allow_pii=not args.no_pii,
                     confirm=args.confirm,
                 )
+                if failed:
+                    judgement["_pending_actions"] = failed
 
     if not args.dry_run:
         save_memory(memory)
-        print(f"💾 Memory updated: {len(memory)} posts | Added {new_analyses} new")
+        logger.info("Memory updated: %d posts (added %d new)", len(memory), new_analyses)
     else:
-        print(f"🔒 Dry run — memory not saved ({new_analyses} posts analyzed)")
+        logger.info("Dry run — memory not saved (%d posts analyzed)", new_analyses)
 
-    print_results(results)
-    print("\n✅ Run complete.")
+    log_results(results)
+    logger.info("Run complete.")
 
 
 # ─── Webhook mode (long-running server) ─────────────────────────────────
+class WebhookWorker:
+    """Background worker that drains post_ids from a queue.
+
+    HTTP handler enqueues on arrival and returns 202 immediately — Ollama
+    calls run here, off the request path, so a slow model never blocks the
+    public endpoint or causes The Colony to mark delivery as failed.
+
+    A single worker thread is intentional: Ollama is GPU-bound and concurrent
+    analyses on one GPU slow each other down with no throughput win. The
+    ``memory_lock`` + ``inflight`` set still coordinate against the (unused
+    today) possibility of adding more workers later.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: ColonyClient,
+        own_username: str,
+        model: str,
+        allow_vote: bool,
+        allow_lang: bool,
+        allow_pii: bool,
+    ) -> None:
+        self.client = client
+        self.own_username = own_username
+        self.model = model
+        self.allow_vote = allow_vote
+        self.allow_lang = allow_lang
+        self.allow_pii = allow_pii
+        self.q: queue.Queue[str] = queue.Queue(maxsize=WEBHOOK_QUEUE_SIZE)
+        self.memory_lock = threading.Lock()
+        self.inflight_lock = threading.Lock()
+        self.inflight: set[str] = set()
+        self.processed_since_prune = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="sentinel-worker", daemon=True)
+
+        # Warm start: replay any pending actions from previous runs once at boot.
+        with self.memory_lock:
+            memory = load_memory()
+            memory = prune_memory(memory)
+            retried = retry_pending_actions(self.client, memory)
+            save_memory(memory)
+        if retried:
+            logger.info("Replayed %d pending actions at webhook startup", retried)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        # Unblock the worker thread so it sees the stop flag.
+        try:
+            self.q.put_nowait("__STOP__")
+        except queue.Full:
+            pass
+        self._thread.join(timeout=5)
+
+    def enqueue(self, post_id: str) -> str:
+        """Enqueue a post for analysis. Returns a status string for the HTTP
+        response:
+          - "queued"      — accepted and added to the work queue
+          - "duplicate"   — already in-flight or already analyzed
+          - "full"        — queue is saturated; the Colony will retry
+        """
+        with self.inflight_lock:
+            if post_id in self.inflight:
+                return "duplicate"
+            # Cheap already-done check — saves an unnecessary LLM call on
+            # webhook redeliveries. The worker does the authoritative check
+            # under the memory lock too.
+            with self.memory_lock:
+                memory = load_memory()
+            prior = memory.get(post_id)
+            if prior and prior.get("score", 0) > 0 and not prior.get("_pending_actions"):
+                return "duplicate"
+
+            try:
+                self.q.put_nowait(post_id)
+            except queue.Full:
+                return "full"
+            self.inflight.add(post_id)
+            return "queued"
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                post_id = self.q.get(timeout=1)
+            except queue.Empty:
+                continue
+            if post_id == "__STOP__":
+                break
+            try:
+                self._process(post_id)
+            except Exception:
+                logger.exception("Worker failed on post %s", post_id[:8])
+            finally:
+                with self.inflight_lock:
+                    self.inflight.discard(post_id)
+                self.q.task_done()
+
+    def _process(self, post_id: str) -> None:
+        # Authoritative already-done check under the lock.
+        with self.memory_lock:
+            memory = load_memory()
+            prior = memory.get(post_id)
+            if prior and prior.get("score", 0) > 0 and not prior.get("_pending_actions"):
+                logger.info("Skipping %s — already analyzed", post_id[:8])
+                return
+
+        post_data = fetch_post_with_comments(self.client, post_id)
+        if post_data is None:
+            return
+
+        if (post_data["post"].get("author") or {}).get("username") == self.own_username:
+            logger.info("Skipping own post %s", post_id[:8])
+            return
+
+        judgement = analyze_post(post_data, self.model)
+        if judgement is None:
+            return
+
+        judgement["analyzed_at"] = datetime.now().isoformat()
+        failed = act_on_judgement(
+            self.client,
+            post_id,
+            judgement,
+            allow_vote=self.allow_vote,
+            allow_lang=self.allow_lang,
+            allow_pii=self.allow_pii,
+        )
+        if failed:
+            judgement["_pending_actions"] = failed
+
+        with self.memory_lock:
+            memory = load_memory()
+            memory[post_id] = judgement
+            self.processed_since_prune += 1
+            if self.processed_since_prune >= WEBHOOK_PRUNE_EVERY:
+                memory = prune_memory(memory)
+                self.processed_since_prune = 0
+            save_memory(memory)
+
+        logger.info(
+            "Acted on %s: category=%s vote=%s%s",
+            post_id[:8],
+            judgement.get("category"),
+            judgement.get("vote_recommendation"),
+            f" (failed={len(failed)})" if failed else "",
+        )
+
+
 def make_webhook_handler(
     *,
-    client: ColonyClient,
-    own_username: str,
-    model: str,
+    worker: WebhookWorker,
     secret: str,
     path: str,
-    allow_vote: bool,
-    allow_lang: bool,
-    allow_pii: bool,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a BaseHTTPRequestHandler subclass closing over deps."""
 
@@ -578,46 +885,28 @@ def make_webhook_handler(
                 self._json(400, {"error": "missing post id"})
                 return
 
-            logger.info("Received post_created for %s — analyzing", post_id[:8])
-            post_data = fetch_post_with_comments(client, post_id)
-            if post_data is None:
-                self._json(404, {"error": "post not found"})
+            status_str = worker.enqueue(post_id)
+            if status_str == "full":
+                # 503 lets The Colony retry later when the queue has drained.
+                logger.warning("Queue full — rejecting %s for retry", post_id[:8])
+                self._json(503, {"status": "queue full, retry later"})
+                return
+            if status_str == "duplicate":
+                logger.info("Duplicate delivery for %s — already queued/done", post_id[:8])
+                self._json(200, {"status": "duplicate"})
                 return
 
-            if (post_data["post"].get("author") or {}).get("username") == own_username:
-                logger.info("Skipping own post %s", post_id[:8])
-                self._json(200, {"status": "skipped (own post)"})
-                return
-
-            judgement = analyze_post(post_data, model)
-            if judgement is None:
-                self._json(500, {"error": "analysis failed"})
-                return
-
-            judgement["analyzed_at"] = datetime.now().isoformat()
-            memory = load_memory()
-            memory[post_id] = judgement
-            save_memory(memory)
-
-            act_on_judgement(
-                client,
-                post_id,
-                judgement,
-                allow_vote=allow_vote,
-                allow_lang=allow_lang,
-                allow_pii=allow_pii,
-            )
-            logger.info(
-                "Acted on %s: category=%s vote=%s",
-                post_id[:8],
-                judgement.get("category"),
-                judgement.get("vote_recommendation"),
-            )
-            self._json(200, {"status": "ok", "category": judgement.get("category")})
+            logger.info("Queued post_created for %s", post_id[:8])
+            self._json(202, {"status": "queued"})
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path.rstrip("/") == "/health":
-                self._json(200, {"status": "healthy", "events": ["post_created"]})
+                self._json(200, {
+                    "status": "healthy",
+                    "events": ["post_created"],
+                    "queue_depth": worker.q.qsize(),
+                    "inflight": len(worker.inflight),
+                })
                 return
             self._json(404, {"error": "not found"})
 
@@ -629,7 +918,7 @@ def make_webhook_handler(
             self.end_headers()
             self.wfile.write(data)
 
-        def log_message(self, format: str, *args) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             # Suppress default access log; we use our own logger.
             pass
 
@@ -637,11 +926,7 @@ def make_webhook_handler(
 
 
 def cmd_webhook(args: argparse.Namespace) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-    )
-    print("🚀 Sentinel — webhook mode (Qwen 3.5:9b)")
+    logger.info("Sentinel — webhook mode")
 
     username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
     client, config = get_or_register_client(username)
@@ -653,46 +938,45 @@ def cmd_webhook(args: argparse.Namespace) -> None:
             "Set --secret or the WEBHOOK_SECRET env var for production."
         )
 
-    handler_cls = make_webhook_handler(
+    worker = WebhookWorker(
         client=client,
         own_username=config.get("username", username),
         model=args.model,
-        secret=secret,
-        path=args.path,
         allow_vote=not args.no_vote,
         allow_lang=not args.dry_run,
         allow_pii=not args.no_pii and not args.dry_run,
     )
+    worker.start()
 
-    # Single-threaded HTTPServer is intentional: serializes memory writes
-    # and avoids two analyses racing on the same post.
+    handler_cls = make_webhook_handler(worker=worker, secret=secret, path=args.path)
     server = HTTPServer(("0.0.0.0", args.port), handler_cls)
-    print(f"📡 Listening on http://0.0.0.0:{args.port}{args.path}")
-    print(f"   Health check: http://0.0.0.0:{args.port}/health")
-    print(f"   Subscribed events: post_created")
+    logger.info("Listening on http://0.0.0.0:%d%s", args.port, args.path)
+    logger.info("Health check: http://0.0.0.0:%d/health", args.port)
+    logger.info("Subscribed events: post_created")
     if args.dry_run:
-        print("   🔒 Dry run — no voting / no language tagging / no PII flagging")
+        logger.info("Dry run — no voting / no language tagging / no PII flagging")
     else:
         if args.no_vote:
-            print("   🚫 Voting disabled")
+            logger.info("Voting disabled")
         if args.no_pii:
-            print("   🚫 PII flagging disabled")
+            logger.info("PII flagging disabled")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n👋 Shutting down")
+        logger.info("Shutting down — draining queue")
+        worker.stop()
         server.server_close()
 
 
 def cmd_webhook_register(args: argparse.Namespace) -> None:
-    print("📡 Registering sentinel as a webhook receiver on The Colony...")
+    logger.info("Registering sentinel as a webhook receiver on The Colony")
     username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
     client, _ = get_or_register_client(username)
 
     secret = args.secret or os.environ.get("WEBHOOK_SECRET")
     if not secret:
-        print("❌ Provide --secret or set WEBHOOK_SECRET env var")
+        logger.error("Provide --secret or set WEBHOOK_SECRET env var")
         sys.exit(1)
 
     try:
@@ -702,11 +986,10 @@ def cmd_webhook_register(args: argparse.Namespace) -> None:
             secret=secret,
         )
     except ColonyAPIError as e:
-        print(f"❌ Failed: {e}")
+        logger.error("Failed: %s", e)
         sys.exit(1)
 
-    print(f"✅ Webhook registered (id={result.get('id', '?')})")
-    print(json.dumps(result, indent=2))
+    logger.info("Webhook registered (id=%s): %s", result.get("id", "?"), json.dumps(result))
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────
@@ -785,6 +1068,7 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 
 
 def main() -> None:
+    configure_logging()
     parser = build_parser()
     args = parser.parse_args(_normalize_argv(sys.argv[1:]))
 
@@ -819,7 +1103,8 @@ if __name__ == "__main__":
         try:
             requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
         except (requests.ConnectionError, requests.Timeout):
-            print("❌ Ollama not running. Start with: ollama serve")
+            configure_logging()
+            logger.error("Ollama not running. Start with: ollama serve")
             sys.exit(1)
 
     if _scan_lock_required(sys.argv[1:]):
@@ -827,7 +1112,8 @@ if __name__ == "__main__":
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print("❌ Another sentinel instance is already running")
+            configure_logging()
+            logger.error("Another sentinel instance is already running")
             sys.exit(1)
         try:
             main()
