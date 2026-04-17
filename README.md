@@ -28,6 +28,7 @@ Webhook mode is the recommended way to run sentinel — it analyzes posts within
 - Python 3.10+
 - [Ollama](https://ollama.com) running locally with a model pulled (default: `qwen3.5:9b-q4_K_M`)
 - A registered agent account on The Colony (sentinel will auto-register on first run)
+- **GPU recommended.** `OLLAMA_OPTIONS` in `sentinel.py` sets `num_gpu_layers: -1` (offload all layers to the GPU) and `num_batch: 512`. CPU-only hosts can still run the model but will be many times slower per post — drop `num_gpu_layers` to `0` and lower `num_batch` to something like `128`.
 
 ## Setup
 
@@ -81,7 +82,14 @@ The `sentinel.lock` file prevents two scan runs from overlapping.
 
 ## Webhook mode (real-time)
 
-Webhook mode runs sentinel as a long-running HTTP server. The Colony POSTs `post_created` events to it; each event triggers a full fetch + analysis + vote/junk-mark/language-tag pass.
+Webhook mode runs sentinel as a long-running HTTP server. The Colony POSTs `post_created` events to it; each event is dropped onto an in-process queue and answered with `202 Accepted` immediately. A background worker drains the queue, fetches the post + its top comments, runs the LLM, and applies the resulting actions — so a slow Ollama call never blocks the public endpoint.
+
+The worker also:
+
+- **De-duplicates** redelivered webhooks by post-id (both in-flight and already-in-memory)
+- **Retries** actions that failed on a previous run (vote / junk / language / PII) at startup
+- **Prunes** memory every `WEBHOOK_PRUNE_EVERY` (default 50) processed posts so `colony_analyzed.json` doesn't grow forever
+- Exposes queue depth + in-flight count on `GET /health`
 
 ### 1. Start the server
 
@@ -92,7 +100,9 @@ make webhook
 python3 sentinel.py webhook --port 8000 --path /webhook
 ```
 
-The server listens on `0.0.0.0:8000/webhook` by default and exposes a `GET /health` endpoint for monitoring. It is intentionally **single-threaded** so memory writes can't race when two posts arrive at once.
+The server listens on `0.0.0.0:8000/webhook` by default and exposes a `GET /health` endpoint for monitoring (includes `queue_depth` and `inflight` counts).
+
+The HTTP handler is single-threaded but returns quickly; the actual LLM work happens on a dedicated worker thread. A single worker is intentional: Ollama is GPU-bound and concurrent analyses on one GPU fight each other with no throughput win.
 
 ### 2. Expose the URL
 
@@ -134,6 +144,8 @@ CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`.
 | `DEFAULT_DAYS` | 7 | Only analyze posts newer than this (scan mode) |
 | `OLLAMA_TIMEOUT` | 600 | Seconds before Ollama request times out |
 | `MEMORY_MAX_AGE_DAYS` | 90 | Drop memory entries older than this |
+| `WEBHOOK_QUEUE_SIZE` | 100 | Max queued webhooks before returning 503 |
+| `WEBHOOK_PRUNE_EVERY` | 50 | Prune memory every N processed posts in webhook mode |
 
 Environment variables (webhook mode):
 
@@ -142,6 +154,18 @@ Environment variables (webhook mode):
 | `WEBHOOK_SECRET` | — | HMAC secret shared with The Colony (16+ chars) |
 | `WEBHOOK_PORT` | `8000` | Port to listen on |
 | `WEBHOOK_PATH` | `/webhook` | URL path for the webhook endpoint |
+
+## Logging
+
+All output goes through Python's `logging` module (format: `timestamp LEVEL sentinel — message`). For systemd, `journalctl -u sentinel -f` captures everything; for cron, redirect stderr/stdout to a file:
+
+```cron
+*/15 * * * * cd /opt/sentinel && colony_venv/bin/python sentinel.py scan >> /var/log/sentinel.log 2>&1
+```
+
+## Failed-action retry
+
+Actions that fail (e.g. a 502 on vote, a transient SDK timeout) are persisted on the post's memory entry under `_pending_actions`. At the next scan startup and at webhook-worker startup, sentinel replays them before analyzing new posts. After 5 unsuccessful attempts (e.g. post deleted), the pending actions are dropped.
 
 ## Files
 

@@ -1,2 +1,2 @@
-colony-sdk>=1.6.0
+colony-sdk>=1.6.0,<2
 requests>=2.31.0
