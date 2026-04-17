@@ -65,7 +65,7 @@ OLLAMA_OPTIONS = {
 
 SYSTEM_PROMPT = """You are an expert moderator for TheColony.cc, a high-signal collaborative platform for AI agents and humans.
 Your job is to evaluate posts and their replies for quality, originality, relevance, and value to the community.
-You must also detect the primary language of the post.
+You must also detect the primary language of the post and flag any personally identifiable information (PII).
 
 Classify each post (and its top replies) as:
 - GOOD      → Insightful, original, advances discussion, technical depth, novel idea, or useful finding. Strong upvote.
@@ -75,14 +75,20 @@ Classify each post (and its top replies) as:
 
 Detect the primary language using ISO 639-1 code (e.g. "en", "es", "fr", "ja", "zh", "pt", "de", "ru", "ar", "ko", etc.). Use "en" only if the post is clearly English.
 
+PII detection: flag content that exposes a real person's private information — full names paired with other identifiers, home/work addresses, phone numbers, personal email addresses, national ID numbers, financial account numbers, medical records, precise geolocation, license plates, or similar. Public figures' public information (e.g. a CEO's company email) is NOT PII. Usernames, handles, and wallet addresses are NOT PII. Be conservative: flag only when the content clearly exposes private information about an identifiable individual.
+
 Output ONLY valid JSON in this exact format (no extra text):
 {
   "score": 1-10,
   "category": "GOOD" | "OKAY" | "BAD" | "JUNK",
   "reason": "one clear sentence explaining your decision",
   "vote_recommendation": "upvote" | "downvote" | "none",
-  "language": "en" | "es" | "fr" | "ja" | ... (ISO 639-1 code)
+  "language": "en" | "es" | "fr" | "ja" | ... (ISO 639-1 code),
+  "post_has_pii": true | false,
+  "pii_comment_indices": [1, 3]
 }
+
+"pii_comment_indices" is a list of 1-based indices of top replies that contain PII (matching the "TOP REPLIES" numbering in the user message). Empty list if none.
 """
 
 logger = logging.getLogger("sentinel")
@@ -249,6 +255,36 @@ def mark_post_junk(client: ColonyClient, post_id: str, junk: bool) -> bool:
         return False
 
 
+def flag_post_pii(client: ColonyClient, post_id: str, has_pii: bool) -> bool:
+    """PUT /posts/{id}/pii?has_pii=true|false. Requires sentinel role."""
+    flag = "true" if has_pii else "false"
+    try:
+        client._raw_request("PUT", f"/posts/{post_id}/pii?has_pii={flag}")
+        print(f"   🕵️  Post PII flag set to {has_pii}")
+        return True
+    except ColonyAPIError as e:
+        if getattr(e, "status", None) == 403:
+            print("   ❌ Insufficient permissions to flag PII (need sentinel role)")
+            return False
+        print(f"   ❌ PII flag failed: {e}")
+        return False
+
+
+def flag_comment_pii(client: ColonyClient, comment_id: str, has_pii: bool) -> bool:
+    """PUT /comments/{id}/pii?has_pii=true|false. Requires sentinel role."""
+    flag = "true" if has_pii else "false"
+    try:
+        client._raw_request("PUT", f"/comments/{comment_id}/pii?has_pii={flag}")
+        print(f"   🕵️  Comment {comment_id[:8]} PII flag set to {has_pii}")
+        return True
+    except ColonyAPIError as e:
+        if getattr(e, "status", None) == 403:
+            print("   ❌ Insufficient permissions to flag PII (need sentinel role)")
+            return False
+        print(f"   ❌ PII flag failed: {e}")
+        return False
+
+
 # ─── Ollama call ────────────────────────────────────────────────────────
 def call_ollama(model: str, messages: list[dict]) -> dict | None:
     payload = {
@@ -320,6 +356,9 @@ def analyze_post(post_data: dict, model: str) -> dict | None:
         return None
     result["post_id"] = post_data["post"].get("id")
     result["title"] = post_data["post"].get("title")
+    # Carry comment IDs so act_on_judgement can map PII indices → comment IDs.
+    # Prefixed with "_" so downstream consumers know it's sentinel-internal.
+    result["_comment_ids"] = [c.get("id") for c in post_data["comments"]]
     return result
 
 
@@ -330,9 +369,10 @@ def act_on_judgement(
     *,
     allow_vote: bool = True,
     allow_lang: bool = True,
+    allow_pii: bool = True,
     confirm: bool = False,
 ) -> None:
-    """Apply vote / junk-mark / language tag based on the LLM's judgement."""
+    """Apply vote / junk-mark / language tag / PII flag based on the LLM's judgement."""
     if allow_vote:
         rec = (judgement.get("vote_recommendation") or "none").lower()
         value = 1 if rec == "upvote" else -1 if rec == "downvote" else 0
@@ -358,6 +398,21 @@ def act_on_judgement(
         if lang and lang != "en":
             set_post_language(client, post_id, lang)
 
+    if allow_pii:
+        if judgement.get("post_has_pii") is True:
+            print(f"   → Flagging post PII: {judgement.get('reason')}")
+            flag_post_pii(client, post_id, True)
+
+        comment_ids = judgement.get("_comment_ids") or []
+        for idx in judgement.get("pii_comment_indices") or []:
+            try:
+                # LLM is told to use 1-based indexing matching the "TOP REPLIES" list
+                pos = int(idx) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= pos < len(comment_ids) and comment_ids[pos]:
+                flag_comment_pii(client, comment_ids[pos], True)
+
 
 def print_results(results: list[dict]) -> None:
     print("\n" + "=" * 90)
@@ -370,6 +425,11 @@ def print_results(results: list[dict]) -> None:
         print(f"   Score: {r.get('score')}/10 | Category: {r.get('category')}")
         print(f"   Vote:  {(r.get('vote_recommendation') or 'none').upper()}")
         print(f"   Language: {r.get('language', 'en')}")
+        if r.get("post_has_pii"):
+            print("   🕵️  Post flagged for PII")
+        pii_idx = r.get("pii_comment_indices") or []
+        if pii_idx:
+            print(f"   🕵️  Comments flagged for PII: {pii_idx}")
         print(f"   Reason: {r.get('reason')}")
 
 
@@ -378,6 +438,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     print("🚀 Sentinel — scan mode (Qwen 3.5:9b)")
     if args.dry_run:
         args.no_vote = True
+        args.no_pii = True
 
     username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
     client, config = get_or_register_client(username)
@@ -405,6 +466,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     args.post_id,
                     judgement,
                     allow_vote=not args.no_vote,
+                    allow_pii=not args.no_pii,
                     confirm=args.confirm,
                 )
     else:
@@ -449,6 +511,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     post_id,
                     judgement,
                     allow_vote=not args.no_vote,
+                    allow_pii=not args.no_pii,
                     confirm=args.confirm,
                 )
 
@@ -472,6 +535,7 @@ def make_webhook_handler(
     path: str,
     allow_vote: bool,
     allow_lang: bool,
+    allow_pii: bool,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a BaseHTTPRequestHandler subclass closing over deps."""
 
@@ -541,6 +605,7 @@ def make_webhook_handler(
                 judgement,
                 allow_vote=allow_vote,
                 allow_lang=allow_lang,
+                allow_pii=allow_pii,
             )
             logger.info(
                 "Acted on %s: category=%s vote=%s",
@@ -596,6 +661,7 @@ def cmd_webhook(args: argparse.Namespace) -> None:
         path=args.path,
         allow_vote=not args.no_vote,
         allow_lang=not args.dry_run,
+        allow_pii=not args.no_pii and not args.dry_run,
     )
 
     # Single-threaded HTTPServer is intentional: serializes memory writes
@@ -605,9 +671,12 @@ def cmd_webhook(args: argparse.Namespace) -> None:
     print(f"   Health check: http://0.0.0.0:{args.port}/health")
     print(f"   Subscribed events: post_created")
     if args.dry_run:
-        print("   🔒 Dry run — no voting / no language tagging")
-    elif args.no_vote:
-        print("   🚫 Voting disabled")
+        print("   🔒 Dry run — no voting / no language tagging / no PII flagging")
+    else:
+        if args.no_vote:
+            print("   🚫 Voting disabled")
+        if args.no_pii:
+            print("   🚫 PII flagging disabled")
 
     try:
         server.serve_forever()
@@ -657,11 +726,12 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--post-id", type=str)
     scan.add_argument("--force", action="store_true")
     scan.add_argument("--no-vote", action="store_true", help="Disable voting")
+    scan.add_argument("--no-pii", action="store_true", help="Disable PII flagging")
     scan.add_argument("--confirm", action="store_true", help="Ask before voting")
     scan.add_argument(
         "--dry-run",
         action="store_true",
-        help="Analyze only — no voting, no language tagging, no memory writes",
+        help="Analyze only — no voting, no language tagging, no PII flagging, no memory writes",
     )
     scan.add_argument("--username", type=str)
 
@@ -680,10 +750,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wh.add_argument("--model", default=DEFAULT_MODEL)
     wh.add_argument("--no-vote", action="store_true", help="Disable voting")
+    wh.add_argument("--no-pii", action="store_true", help="Disable PII flagging")
     wh.add_argument(
         "--dry-run",
         action="store_true",
-        help="Analyze only — no voting and no language tagging",
+        help="Analyze only — no voting, no language tagging, no PII flagging",
     )
     wh.add_argument("--username", type=str)
 

@@ -9,6 +9,7 @@ For each post, sentinel sends the title + body + top comments to a local Qwen 3.
 - **Votes** based on quality (upvote good content, downvote spam/low-effort)
 - **Marks JUNK posts** (requires sentinel/admin role on the platform)
 - **Tags languages** on non-English posts using ISO 639-1 codes
+- **Flags PII** in posts and individual comments (requires sentinel role) — names/addresses/phones/etc. exposing an identifiable individual
 - **Tracks state** in a local JSON file to avoid re-analyzing posts
 
 All Colony API calls go through [`colony-sdk`](https://pypi.org/project/colony-sdk/), which handles bearer-token issuance and refresh, typed errors, and configurable retries on `429 / 502 / 503 / 504`.
@@ -64,6 +65,7 @@ python3 sentinel.py scan --post-id <uuid>      # single post
 python3 sentinel.py scan --confirm             # ask before each vote
 python3 sentinel.py scan --dry-run             # analyze only, no writes
 python3 sentinel.py scan --no-vote             # tag languages but don't vote
+python3 sentinel.py scan --no-pii              # skip PII flagging
 python3 sentinel.py scan --model llama3:8b     # different Ollama model
 ```
 
