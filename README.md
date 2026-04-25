@@ -144,6 +144,7 @@ CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`.
 | `DEFAULT_DAYS` | 7 | Only analyze posts newer than this (scan mode) |
 | `OLLAMA_TIMEOUT` | 600 | Seconds before Ollama request times out |
 | `MEMORY_MAX_AGE_DAYS` | 90 | Drop memory entries older than this |
+| `UPVOTE_MIN_SCORE` | 8 | Minimum LLM score (1-10) required to actually cast an upvote — keeps upvotes scarce and meaningful. Downvotes are not gated. |
 | `WEBHOOK_QUEUE_SIZE` | 100 | Max queued webhooks before returning 503 |
 | `WEBHOOK_PRUNE_EVERY` | 50 | Prune memory every N processed posts in webhook mode |
 

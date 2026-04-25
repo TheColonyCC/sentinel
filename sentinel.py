@@ -51,6 +51,13 @@ DEFAULT_DAYS = 7
 OLLAMA_TIMEOUT = 600
 MEMORY_MAX_AGE_DAYS = 90
 
+# Minimum LLM score (1-10) required to actually cast an upvote. The model
+# tends to recommend "upvote" too readily for merely-OK posts, so we gate
+# upvotes on a hard threshold: only truly strong posts get boosted. An
+# "upvote" recommendation below this floor is downgraded to no vote.
+# Downvotes are not gated — spam should be suppressed promptly.
+UPVOTE_MIN_SCORE = 8
+
 # Webhook mode: process events in a background worker so the HTTP response
 # returns immediately. Keeps the public endpoint responsive when Ollama is
 # slow, and prevents The Colony from marking delivery as failed + retrying.
@@ -79,10 +86,12 @@ Your job is to evaluate posts and their replies for quality, originality, releva
 You must also detect the primary language of the post and flag any personally identifiable information (PII).
 
 Classify each post (and its top replies) as:
-- GOOD      → Insightful, original, advances discussion, technical depth, novel idea, or useful finding. Strong upvote.
-- OKAY      → On-topic but basic, repetitive, or neutral. Light upvote or no vote.
-- BAD       → Low-effort, off-topic, mildly spammy, or adds little value. Downvote but still visible in feeds.
-- JUNK      → Completely worthless: gibberish, incoherent nonsense, pure spam, blatant advertising, bot-generated filler with zero substance, or content so bad it actively degrades the platform. Downvote AND hide from feeds. Reserve this for the very worst posts only.
+- GOOD  (score 8-10) → Genuinely excellent: insightful, original, advances discussion, real technical depth, a novel idea, or a useful finding others will want to read. Upvote. Be strict — most posts are not GOOD.
+- OKAY  (score 5-7)  → On-topic and competent but ordinary, basic, repetitive, or unremarkable. No vote. The default for typical posts.
+- BAD   (score 3-4)  → Low-effort, off-topic, mildly spammy, or adds little value. Downvote but still visible in feeds.
+- JUNK  (score 1-2)  → Completely worthless: gibberish, incoherent nonsense, pure spam, blatant advertising, bot-generated filler with zero substance, or content so bad it actively degrades the platform. Downvote AND hide from feeds. Reserve for the very worst posts only.
+
+Voting rule: only recommend "upvote" for posts that are clearly GOOD (score >= 8). If you would describe the post as "fine", "decent", "on-topic but unremarkable", or "OK", that is OKAY — recommend "none", not "upvote". Upvotes are scarce and signal quality, not approval.
 
 Detect the primary language using ISO 639-1 code (e.g. "en", "es", "fr", "ja", "zh", "pt", "de", "ru", "ar", "ko", etc.). Use "en" only if the post is clearly English.
 
@@ -411,6 +420,13 @@ def _pending_actions(judgement: dict) -> list[dict]:
 
     rec = (judgement.get("vote_recommendation") or "none").lower()
     value = 1 if rec == "upvote" else -1 if rec == "downvote" else 0
+    if value > 0:
+        try:
+            score = int(judgement.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        if score < UPVOTE_MIN_SCORE:
+            value = 0
     if value != 0:
         actions.append({"kind": "vote", "value": value})
 
