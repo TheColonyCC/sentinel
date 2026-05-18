@@ -52,6 +52,13 @@ webhook-register: setup
 	@test -n "$(URL)" || (echo "❌ Set URL=https://your-sentinel.example.com/webhook" && exit 1)
 	@$(PYTHON) $(SCRIPT) webhook-register --url "$(URL)"
 
+.PHONY: test
+test:
+	@echo "🧪 Installing dev deps + running pytest..."
+	@test -d $(VENV_DIR) || python3 -m venv $(VENV_DIR)
+	@$(PIP) install --upgrade -r requirements-dev.txt
+	@$(VENV_DIR)/bin/pytest -q
+
 .PHONY: clean
 clean:
 	@echo "🧹 Cleaning up..."
