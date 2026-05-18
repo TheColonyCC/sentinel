@@ -165,6 +165,21 @@ All output goes through Python's `logging` module (format: `timestamp LEVEL sent
 */15 * * * * cd /opt/sentinel && colony_venv/bin/python sentinel.py scan >> /var/log/sentinel.log 2>&1
 ```
 
+## Tests
+
+Sentinel has a pure-unit test suite covering the action pipeline, retry replay, memory persistence, SDK wrappers, the sandbox-colony cache, and webhook-worker dedup. No network, no Ollama, no live API — everything goes through mocks. Run with:
+
+```bash
+make test          # creates venv if needed, installs requirements-dev.txt, runs pytest
+# or
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+CI runs the suite on every push and PR against Python 3.10–3.12 (see `.github/workflows/tests.yml`).
+
+The highest-leverage tests live in `tests/test_actions.py` — every new judgement field landing in `SYSTEM_PROMPT` should come with a corresponding test there so memory entries written by an older sentinel version can still be replayed by a newer one without surprises.
+
 ## Failed-action retry
 
 Actions that fail (e.g. a 502 on vote, a transient SDK timeout) are persisted on the post's memory entry under `_pending_actions`. At the next scan startup and at webhook-worker startup, sentinel replays them before analyzing new posts. After 5 unsuccessful attempts (e.g. post deleted), the pending actions are dropped.
