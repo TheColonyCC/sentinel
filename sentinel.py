@@ -367,6 +367,45 @@ def move_post_to_sandbox(client: ColonyClient, post_id: str, target: str = TEST_
         return False
 
 
+def mark_post_scanned(client: ColonyClient, post_id: str) -> bool:
+    """PUT /posts/{id}/sentinel-scanned. Requires sentinel role.
+
+    Wraps the SDK's ``mark_post_scanned`` (added in colony-sdk 1.11.0).
+    Mirrors the local memory file: records on the server that this
+    sentinel has analyzed the post. The local file stays the
+    authoritative skip-cache for now; the server-side flag is a
+    parallel signal that future sentinel revisions can use to fetch
+    only unscanned posts.
+    """
+    try:
+        client.mark_post_scanned(post_id)
+        logger.debug("Post %s marked scanned on server", post_id[:8])
+        return True
+    except ColonyAPIError as e:
+        if getattr(e, "status", None) == 403:
+            logger.error("Insufficient permissions to mark scanned (need sentinel role)")
+            return False
+        logger.warning("mark_post_scanned failed for post %s: %s", post_id[:8], e)
+        return False
+
+
+def mark_comment_scanned(client: ColonyClient, comment_id: str) -> bool:
+    """PUT /comments/{id}/sentinel-scanned. Requires sentinel role.
+
+    Mirrors :func:`mark_post_scanned` for comments.
+    """
+    try:
+        client.mark_comment_scanned(comment_id)
+        logger.debug("Comment %s marked scanned on server", comment_id[:8])
+        return True
+    except ColonyAPIError as e:
+        if getattr(e, "status", None) == 403:
+            logger.error("Insufficient permissions to mark scanned (need sentinel role)")
+            return False
+        logger.warning("mark_comment_scanned failed for comment %s: %s", comment_id[:8], e)
+        return False
+
+
 # Per-process cache of {colony_id: is_sandbox} so a webhook burst doesn't
 # call /colonies on every post. Populated lazily on first lookup. Cleared
 # only on process restart — sandbox membership flips infrequently and a
@@ -528,6 +567,17 @@ def _pending_actions(judgement: dict) -> list[dict]:
     if judgement.get("is_test_post") is True:
         actions.append({"kind": "move_to_sandbox", "source_colony_id": judgement.get("_colony_id")})
 
+    # Record on the server that the sentinel has scanned this post and
+    # every top-level comment it included in the prompt. Always emitted
+    # — every scanned row should be marked, regardless of judgement
+    # category. The local memory file remains authoritative for the
+    # skip-cache; this is a parallel signal that a future sentinel
+    # revision will use to filter ``/posts?sentinel_scanned=false``.
+    actions.append({"kind": "mark_scanned_post"})
+    for cid in comment_ids:
+        if cid:
+            actions.append({"kind": "mark_scanned_comment", "comment_id": cid})
+
     return actions
 
 
@@ -569,6 +619,13 @@ def _apply_action(client: ColonyClient, post_id: str, action: dict) -> bool:
             )
             return True
         return move_post_to_sandbox(client, post_id)
+    if kind == "mark_scanned_post":
+        return mark_post_scanned(client, post_id)
+    if kind == "mark_scanned_comment":
+        cid = action.get("comment_id")
+        if not cid:
+            return False
+        return mark_comment_scanned(client, str(cid))
     logger.warning("Unknown action kind: %s", kind)
     return False
 
@@ -581,6 +638,7 @@ def act_on_judgement(
     allow_vote: bool = True,
     allow_lang: bool = True,
     allow_pii: bool = True,
+    allow_mark_scanned: bool = True,
     confirm: bool = False,
 ) -> list[dict]:
     """Apply all actions derived from a judgement.
@@ -605,6 +663,11 @@ def act_on_judgement(
         if kind == "language" and not allow_lang:
             continue
         if kind in ("post_pii", "comment_pii") and not allow_pii:
+            continue
+        if kind in ("mark_scanned_post", "mark_scanned_comment") and not allow_mark_scanned:
+            # Mark-scanned has its own gate (not allow_vote) because it's
+            # a "I processed this" record, not a moderation action. Off
+            # only in --dry-run modes that explicitly want zero writes.
             continue
         allowed.append(a)
 
@@ -817,6 +880,7 @@ class WebhookWorker:
         allow_vote: bool,
         allow_lang: bool,
         allow_pii: bool,
+        allow_mark_scanned: bool,
     ) -> None:
         self.client = client
         self.own_username = own_username
@@ -824,6 +888,7 @@ class WebhookWorker:
         self.allow_vote = allow_vote
         self.allow_lang = allow_lang
         self.allow_pii = allow_pii
+        self.allow_mark_scanned = allow_mark_scanned
         self.q: queue.Queue[str] = queue.Queue(maxsize=WEBHOOK_QUEUE_SIZE)
         self.memory_lock = threading.Lock()
         self.inflight_lock = threading.Lock()
@@ -925,6 +990,7 @@ class WebhookWorker:
             allow_vote=self.allow_vote,
             allow_lang=self.allow_lang,
             allow_pii=self.allow_pii,
+            allow_mark_scanned=self.allow_mark_scanned,
         )
         if failed:
             judgement["_pending_actions"] = failed
@@ -1054,6 +1120,7 @@ def cmd_webhook(args: argparse.Namespace) -> None:
         allow_vote=not args.no_vote,
         allow_lang=not args.dry_run,
         allow_pii=not args.no_pii and not args.dry_run,
+        allow_mark_scanned=not args.dry_run,
     )
     worker.start()
 
