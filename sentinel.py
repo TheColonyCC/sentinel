@@ -72,6 +72,11 @@ DEFAULT_BIO = (
     "Local Qwen 3.5 moderator that scores, votes, and sets language on TheColony.cc posts."
 )
 
+# Slug of the canonical sandbox colony posts get relocated into when the LLM
+# flags them as tests. The move API only accepts target colonies whose
+# ``is_sandbox`` flag is set; "test-posts" is the one seeded by default.
+TEST_POSTS_COLONY = "test-posts"
+
 OLLAMA_OPTIONS = {
     "temperature": 0.3,
     "num_ctx": 16384,
@@ -97,6 +102,8 @@ Detect the primary language using ISO 639-1 code (e.g. "en", "es", "fr", "ja", "
 
 PII detection: flag content that exposes a real person's private information — full names paired with other identifiers, home/work addresses, phone numbers, personal email addresses, national ID numbers, financial account numbers, medical records, precise geolocation, license plates, or similar. Public figures' public information (e.g. a CEO's company email) is NOT PII. Usernames, handles, and wallet addresses are NOT PII. Be conservative: flag only when the content clearly exposes private information about an identifiable individual.
 
+Test-post detection: set "is_test_post" to true when the post is clearly someone exercising the platform rather than communicating — for example: title or body is "test", "testing", "hello world", "first post", random keysmashed strings, placeholder lorem ipsum, single-character bodies, or otherwise content with no apparent intent to convey information to other users. Be conservative — a short genuine question is NOT a test post. When in doubt, leave it false.
+
 Output ONLY valid JSON in this exact format (no extra text):
 {
   "score": 1-10,
@@ -105,7 +112,8 @@ Output ONLY valid JSON in this exact format (no extra text):
   "vote_recommendation": "upvote" | "downvote" | "none",
   "language": "en" | "es" | "fr" | "ja" | ... (ISO 639-1 code),
   "post_has_pii": true | false,
-  "pii_comment_indices": [1, 3]
+  "pii_comment_indices": [1, 3],
+  "is_test_post": true | false
 }
 
 "pii_comment_indices" is a list of 1-based indices of top replies that contain PII (matching the "TOP REPLIES" numbering in the user message). Empty list if none.
@@ -331,6 +339,66 @@ def flag_comment_pii(client: ColonyClient, comment_id: str, has_pii: bool) -> bo
         return False
 
 
+def move_post_to_sandbox(client: ColonyClient, post_id: str, target: str = TEST_POSTS_COLONY) -> bool:
+    """PUT /posts/{id}/colony?colony=<target>. Requires sentinel role.
+
+    Wraps the SDK's ``move_post_to_colony`` (added in colony-sdk 1.10.0)
+    for parity with the other sentinel-only helpers in this file —
+    uniform logging + permission diagnostics, idempotent return on
+    already-in-target.
+    """
+    try:
+        result = client.move_post_to_colony(post_id, target)
+        if result.get("moved"):
+            logger.info(
+                "Moved post %s from %s to '%s'",
+                post_id[:8],
+                str(result.get("from_colony_id", "?"))[:8],
+                target,
+            )
+        else:
+            logger.info("Post %s already in '%s' — no move needed", post_id[:8], target)
+        return True
+    except ColonyAPIError as e:
+        if getattr(e, "status", None) == 403:
+            logger.error("Insufficient permissions to move post (need sentinel role)")
+            return False
+        logger.warning("Move failed for post %s: %s", post_id[:8], e)
+        return False
+
+
+# Per-process cache of {colony_id: is_sandbox} so a webhook burst doesn't
+# call /colonies on every post. Populated lazily on first lookup. Cleared
+# only on process restart — sandbox membership flips infrequently and a
+# stale "True" just means we skip an attempted move (safe).
+_SANDBOX_CACHE: dict[str, bool] = {}
+
+
+def _is_sandbox_colony(client: ColonyClient, colony_id: str) -> bool:
+    """Return True iff the colony identified by ``colony_id`` has its
+    ``is_sandbox`` flag set on the server.
+
+    Falls back to ``False`` on lookup failure so a transient API blip
+    doesn't accidentally suppress moves. The first call after process
+    start incurs one ``/colonies`` request; subsequent lookups are O(1).
+    """
+    if not colony_id:
+        return False
+    if colony_id in _SANDBOX_CACHE:
+        return _SANDBOX_CACHE[colony_id]
+    try:
+        data = client.get_colonies(limit=200)
+    except ColonyAPIError as e:
+        logger.warning("Failed to fetch colony list for sandbox lookup: %s", e)
+        return False
+    colonies = data if isinstance(data, list) else data.get("colonies", [])
+    for c in colonies:
+        cid = c.get("id")
+        if cid:
+            _SANDBOX_CACHE[str(cid)] = bool(c.get("is_sandbox"))
+    return _SANDBOX_CACHE.get(colony_id, False)
+
+
 # ─── Ollama call ────────────────────────────────────────────────────────
 def call_ollama(model: str, messages: list[dict]) -> dict | None:
     payload = {
@@ -405,6 +473,10 @@ def analyze_post(post_data: dict, model: str) -> dict | None:
     # Carry comment IDs so act_on_judgement can map PII indices → comment IDs.
     # Prefixed with "_" so downstream consumers know it's sentinel-internal.
     result["_comment_ids"] = [c.get("id") for c in post_data["comments"]]
+    # Carry the source colony so act_on_judgement can decide whether a
+    # "move to sandbox" action is needed — skipped when the post is
+    # already in a sandbox colony.
+    result["_colony_id"] = post_data["post"].get("colony_id")
     return result
 
 
@@ -449,6 +521,13 @@ def _pending_actions(judgement: dict) -> list[dict]:
         if 0 <= pos < len(comment_ids) and comment_ids[pos]:
             actions.append({"kind": "comment_pii", "comment_id": comment_ids[pos]})
 
+    # Relocate test posts into the sandbox colony so curated feeds stay
+    # clean without us having to delete the post. The source-colony
+    # sandbox check happens in _apply_action so a stale judgement
+    # replayed from memory still gets a live decision.
+    if judgement.get("is_test_post") is True:
+        actions.append({"kind": "move_to_sandbox", "source_colony_id": judgement.get("_colony_id")})
+
     return actions
 
 
@@ -482,6 +561,14 @@ def _apply_action(client: ColonyClient, post_id: str, action: dict) -> bool:
         if not cid:
             return False
         return flag_comment_pii(client, str(cid), True)
+    if kind == "move_to_sandbox":
+        source = action.get("source_colony_id")
+        if source and _is_sandbox_colony(client, str(source)):
+            logger.info(
+                "Post %s already in a sandbox colony — skipping move", post_id[:8]
+            )
+            return True
+        return move_post_to_sandbox(client, post_id)
     logger.warning("Unknown action kind: %s", kind)
     return False
 
@@ -510,6 +597,10 @@ def act_on_judgement(
             continue
         if kind == "junk" and not allow_vote:
             # Junk-marking is gated by --no-vote (both are moderation actions).
+            continue
+        if kind == "move_to_sandbox" and not allow_vote:
+            # Same family as junk — gated by --no-vote so dry-runs / read-only
+            # passes don't relocate posts.
             continue
         if kind == "language" and not allow_lang:
             continue
@@ -584,6 +675,8 @@ def log_results(results: list[dict]) -> None:
         pii_idx = r.get("pii_comment_indices") or []
         if pii_idx:
             pii_suffix += f" [comment-PII={pii_idx}]"
+        if r.get("is_test_post"):
+            pii_suffix += " [test-post→sandbox]"
         logger.info(
             "%s score=%s vote=%s lang=%s%s — %s (%s)",
             r.get("category"),
