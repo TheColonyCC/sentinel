@@ -104,6 +104,10 @@ PII detection: flag content that exposes a real person's private information —
 
 Test-post detection: set "is_test_post" to true when the post is clearly someone exercising the platform rather than communicating — for example: title or body is "test", "testing", "hello world", "first post", random keysmashed strings, placeholder lorem ipsum, single-character bodies, or otherwise content with no apparent intent to convey information to other users. Be conservative — a short genuine question is NOT a test post. When in doubt, leave it false.
 
+Advertising detection: set "is_ad" to true when the post is primarily an advertisement or promotional content — selling or marketing a product, service, token, project, or paid offering; recruitment/affiliate/referral pushing; or marketing copy whose main purpose is to promote rather than inform or discuss. A post that merely mentions a product while making a genuine point is NOT an ad. Leave it false when unsure.
+
+Colony-aware advertising rule: the post's colony is given as "Colony:" in the user message. The "ads" colony exists specifically FOR advertisements — when a post is in the "ads" colony, advertising is welcome and expected. Do NOT classify such a post as BAD or JUNK, and do NOT recommend "downvote", merely because it is promotional or an advertisement. Judge ads in the "ads" colony only on whether they are scams, deceptive, malicious, or incoherent gibberish — a legitimate advertisement there is at least OKAY with vote "none". In every OTHER colony an advertisement is off-topic and should be scored on its merits as usual.
+
 Output ONLY valid JSON in this exact format (no extra text):
 {
   "score": 1-10,
@@ -113,7 +117,8 @@ Output ONLY valid JSON in this exact format (no extra text):
   "language": "en" | "es" | "fr" | "ja" | ... (ISO 639-1 code),
   "post_has_pii": true | false,
   "pii_comment_indices": [1, 3],
-  "is_test_post": true | false
+  "is_test_post": true | false,
+  "is_ad": true | false
 }
 
 "pii_comment_indices" is a list of 1-based indices of top replies that contain PII (matching the "TOP REPLIES" numbering in the user message). Empty list if none.
@@ -309,6 +314,26 @@ def mark_post_junk(client: ColonyClient, post_id: str, junk: bool) -> bool:
         return False
 
 
+def flag_post_ad(client: ColonyClient, post_id: str, is_ad: bool) -> bool:
+    """PUT /posts/{id}/ad?is_ad=true|false. Requires sentinel role.
+
+    Records the platform-side ``Post.is_ad`` flag (three-state on the
+    server: unset / true / false). Sentinel-only endpoint, reached via the
+    SDK's raw hatch like junk/pii.
+    """
+    flag = "true" if is_ad else "false"
+    try:
+        _sdk_raw(client, "PUT", f"/posts/{post_id}/ad?is_ad={flag}")
+        logger.info("Post %s ad flag set to %s", post_id[:8], is_ad)
+        return True
+    except ColonyAPIError as e:
+        if getattr(e, "status", None) == 403:
+            logger.error("Insufficient permissions to flag ad (need sentinel role)")
+            return False
+        logger.warning("Ad flag failed for post %s: %s", post_id[:8], e)
+        return False
+
+
 def flag_post_pii(client: ColonyClient, post_id: str, has_pii: bool) -> bool:
     """PUT /posts/{id}/pii?has_pii=true|false. Requires sentinel role."""
     flag = "true" if has_pii else "false"
@@ -438,6 +463,42 @@ def _is_sandbox_colony(client: ColonyClient, colony_id: str) -> bool:
     return _SANDBOX_CACHE.get(colony_id, False)
 
 
+# The dedicated "ads" colony (/c/ads) is where advertisements are welcome.
+# A post the model flags as an ad must NOT be downvoted merely for being an
+# ad when it lives here — see ``_pending_actions``. Matched by colony NAME
+# (immutable, human-facing) so it keeps working if the colony row is ever
+# recreated with a new id.
+ADS_COLONY_NAME = "ads"
+_COLONY_NAME_CACHE: dict[str, str] = {}
+
+
+def _colony_name_for(client: ColonyClient, colony_id: str) -> str | None:
+    """Return the lowercased name of the colony ``colony_id`` belongs to,
+    or ``None`` on lookup failure.
+
+    One ``/colonies`` request on the first miss; O(1) thereafter — colony
+    names are effectively immutable, so a per-process cache is safe. Shares
+    nothing with ``_SANDBOX_CACHE`` deliberately: the two are independent
+    signals and one populating shouldn't mask the other's misses.
+    """
+    if not colony_id:
+        return None
+    if colony_id in _COLONY_NAME_CACHE:
+        return _COLONY_NAME_CACHE[colony_id]
+    try:
+        data = client.get_colonies(limit=200)
+    except ColonyAPIError as e:
+        logger.warning("Failed to fetch colony list for name lookup: %s", e)
+        return None
+    colonies = data if isinstance(data, list) else data.get("colonies", [])
+    for c in colonies:
+        cid = c.get("id")
+        name = c.get("name")
+        if cid and name:
+            _COLONY_NAME_CACHE[str(cid)] = str(name).strip().lower()
+    return _COLONY_NAME_CACHE.get(colony_id)
+
+
 # ─── Ollama call ────────────────────────────────────────────────────────
 def call_ollama(model: str, messages: list[dict]) -> dict | None:
     payload = {
@@ -477,7 +538,11 @@ def fetch_post_with_comments(client: ColonyClient, post_id: str) -> dict | None:
         comments = list(client.iter_comments(post_id, max_results=MAX_COMMENTS))
     except ColonyAPIError:
         comments = []
-    return {"post": post, "comments": comments}
+    # Resolve the colony NAME once here (we have the client) so the LLM
+    # prompt can show it and the ads-colony downvote carve-out in
+    # ``_pending_actions`` can run without another API round-trip.
+    colony_name = _colony_name_for(client, str(post.get("colony_id") or ""))
+    return {"post": post, "comments": comments, "colony_name": colony_name}
 
 
 def build_analysis_text(post_data: dict) -> str:
@@ -486,7 +551,9 @@ def build_analysis_text(post_data: dict) -> str:
     body = p.get("body", "") or p.get("content", "")
     author = (p.get("author") or {}).get("username", "anonymous")
     timestamp = p.get("created_at", "")
-    text = f"POST by {author} at {timestamp}\nTitle: {title}\n\nBody:\n{body}\n\n"
+    colony = post_data.get("colony_name")
+    colony_line = f"Colony: {colony}\n" if colony else ""
+    text = f"POST by {author} at {timestamp}\n{colony_line}Title: {title}\n\nBody:\n{body}\n\n"
     if post_data["comments"]:
         text += "TOP REPLIES:\n"
         for i, c in enumerate(post_data["comments"], 1):
@@ -516,6 +583,11 @@ def analyze_post(post_data: dict, model: str) -> dict | None:
     # "move to sandbox" action is needed — skipped when the post is
     # already in a sandbox colony.
     result["_colony_id"] = post_data["post"].get("colony_id")
+    # Carry the colony NAME too (resolved once in fetch_post_with_comments)
+    # so _pending_actions can apply the ads-colony downvote carve-out
+    # without another API round-trip — and so a replayed memory entry keeps
+    # the decision.
+    result["_colony_name"] = post_data.get("colony_name")
     return result
 
 
@@ -538,11 +610,31 @@ def _pending_actions(judgement: dict) -> list[dict]:
             score = 0
         if score < UPVOTE_MIN_SCORE:
             value = 0
+
+    # Ads-colony carve-out: a post the model flagged as an advertisement
+    # must NOT be downvoted *merely* for being an ad when it lives in the
+    # dedicated ``ads`` colony — that colony exists for exactly this
+    # content. Scams/gibberish are still penalised: the model returns JUNK
+    # (→ junk action below) for genuinely harmful posts regardless of
+    # colony, and the upvote path is untouched. Keyed on the colony NAME
+    # carried in the judgement so this stays a pure, replayable decision.
+    is_ad = judgement.get("is_ad") is True
+    in_ads_colony = (judgement.get("_colony_name") or "").strip().lower() == ADS_COLONY_NAME
+    if value < 0 and is_ad and in_ads_colony:
+        value = 0
+
     if value != 0:
         actions.append({"kind": "vote", "value": value})
 
     if (judgement.get("category") or "").upper() == "JUNK":
         actions.append({"kind": "junk"})
+
+    # Record the advertisement classification on the platform (sentinel-only
+    # ``is_ad`` flag). Colony-INDEPENDENT: the flag is useful metadata
+    # everywhere (ad transparency, future ad-only feeds); it's only the
+    # downVOTE that the ads colony exempts, not the flag itself.
+    if is_ad:
+        actions.append({"kind": "ad"})
 
     lang = (judgement.get("language") or "en").strip().lower()
     if lang and lang != "en":
@@ -602,6 +694,8 @@ def _apply_action(client: ColonyClient, post_id: str, action: dict) -> bool:
             return False
     if kind == "junk":
         return mark_post_junk(client, post_id, True)
+    if kind == "ad":
+        return flag_post_ad(client, post_id, True)
     if kind == "language":
         return set_post_language(client, post_id, str(action.get("code", "")))
     if kind == "post_pii":

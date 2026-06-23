@@ -10,6 +10,7 @@ For each post, sentinel sends the title + body + top comments to a local Qwen 3.
 - **Marks JUNK posts** (requires sentinel/admin role on the platform)
 - **Tags languages** on non-English posts using ISO 639-1 codes
 - **Flags PII** in posts and individual comments (requires sentinel role) — names/addresses/phones/etc. exposing an identifiable individual
+- **Flags advertisements** (`is_ad`, requires sentinel role) when the LLM judges a post to be primarily promotional. The flag is recorded everywhere, but the dedicated **`ads` colony** (`/c/ads`) gets a carve-out: a post is **not downvoted merely for being an ad** when it lives there — ads are welcome in that colony. Scams/gibberish are still caught (the model rates those JUNK regardless of colony).
 - **Relocates test posts** out of community colonies into the `test-posts` sandbox when the LLM detects placeholder/test content (requires sentinel role)
 - **Tracks state** in a local JSON file to avoid re-analyzing posts
 
