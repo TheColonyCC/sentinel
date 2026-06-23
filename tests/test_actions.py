@@ -312,3 +312,102 @@ class TestActOnJudgement:
         failed = s.act_on_judgement(mock_client, "p1", j)
         mock_client.vote_post.assert_called_once()
         assert {a["kind"] for a in failed} == {"mark_scanned_post"}
+
+
+# ────────────────────────────────────────────────────────────────────
+# Advertisement flag + ads-colony downvote carve-out
+# ────────────────────────────────────────────────────────────────────
+class TestAdActions:
+    def test_is_ad_emits_ad_action(self, make_judgement):
+        j = make_judgement(is_ad=True)
+        kinds = [a["kind"] for a in s._pending_actions(j)]
+        assert "ad" in kinds
+
+    def test_not_ad_emits_no_ad_action(self, make_judgement):
+        j = make_judgement(is_ad=False)
+        kinds = [a["kind"] for a in s._pending_actions(j)]
+        assert "ad" not in kinds
+
+    def test_ad_flag_is_colony_independent(self, make_judgement):
+        """The ``is_ad`` flag itself is recorded everywhere — it's only the
+        downvote that the ads colony exempts, not the flag."""
+        j = make_judgement(is_ad=True, _colony_name="general")
+        kinds = [a["kind"] for a in s._pending_actions(j)]
+        assert "ad" in kinds
+
+    def test_downvote_suppressed_for_ad_in_ads_colony(self, make_judgement):
+        j = make_judgement(
+            vote_recommendation="downvote", score=3, category="BAD",
+            is_ad=True, _colony_name="ads",
+        )
+        kinds = [a["kind"] for a in s._pending_actions(j)]
+        # No downvote — being an ad is not a downvote-worthy offence in /c/ads.
+        assert "vote" not in kinds
+        # ...but the post is still flagged as an ad.
+        assert "ad" in kinds
+
+    def test_downvote_kept_for_ad_in_other_colony(self, make_judgement):
+        j = make_judgement(
+            vote_recommendation="downvote", score=3, category="BAD",
+            is_ad=True, _colony_name="general",
+        )
+        vote = next(a for a in s._pending_actions(j) if a["kind"] == "vote")
+        assert vote["value"] == -1
+
+    def test_downvote_kept_for_non_ad_in_ads_colony(self, make_judgement):
+        """The carve-out only fires for ads. A genuinely bad NON-ad post in
+        the ads colony is still downvoted."""
+        j = make_judgement(
+            vote_recommendation="downvote", score=3, category="BAD",
+            is_ad=False, _colony_name="ads",
+        )
+        vote = next(a for a in s._pending_actions(j) if a["kind"] == "vote")
+        assert vote["value"] == -1
+
+    def test_upvote_unaffected_for_ad_in_ads_colony(self, make_judgement):
+        """The carve-out only suppresses downvotes — a great ad can still be
+        upvoted."""
+        j = make_judgement(
+            vote_recommendation="upvote", score=9, category="GOOD",
+            is_ad=True, _colony_name="ads",
+        )
+        vote = next(a for a in s._pending_actions(j) if a["kind"] == "vote")
+        assert vote["value"] == 1
+
+    def test_junk_still_marked_for_ad_in_ads_colony(self, make_judgement):
+        """A scam/gibberish post the model still rates JUNK in the ads colony
+        is marked junk — the carve-out is downvote-only, not a free pass."""
+        j = make_judgement(
+            vote_recommendation="downvote", score=1, category="JUNK",
+            is_ad=True, _colony_name="ads",
+        )
+        kinds = [a["kind"] for a in s._pending_actions(j)]
+        assert "junk" in kinds
+        assert "vote" not in kinds  # downvote still suppressed
+
+    def test_apply_ad_action_calls_endpoint(self, mock_client):
+        ok = s._apply_action(mock_client, "p1", {"kind": "ad"})
+        assert ok is True
+        mock_client._raw_request.assert_called_once_with("PUT", "/posts/p1/ad?is_ad=true")
+
+    def test_flag_post_ad_false_on_403(self, mock_client):
+        mock_client._raw_request.side_effect = make_api_error(403)
+        assert s.flag_post_ad(mock_client, "p1", True) is False
+
+    def test_colony_name_resolution_matches_ads(self, mock_client):
+        mock_client.get_colonies.return_value = [
+            {"id": "c-ads", "name": "Ads"},
+            {"id": "c-gen", "name": "general"},
+        ]
+        s._COLONY_NAME_CACHE.clear()
+        assert s._colony_name_for(mock_client, "c-ads") == "ads"
+        assert s._colony_name_for(mock_client, "c-gen") == "general"
+        s._COLONY_NAME_CACHE.clear()
+
+    def test_build_analysis_text_includes_colony(self):
+        text = s.build_analysis_text({
+            "post": {"title": "Buy now", "body": "cheap widgets", "author": {"username": "x"}},
+            "comments": [],
+            "colony_name": "ads",
+        })
+        assert "Colony: ads" in text
