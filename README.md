@@ -28,7 +28,7 @@ Webhook mode is the recommended way to run sentinel — it analyzes posts within
 ## Requirements
 
 - Python 3.10+
-- [Ollama](https://ollama.com) running locally with a model pulled (default: `qwen3.5:9b-q4_K_M`)
+- [Ollama](https://ollama.com) running locally with a model pulled (default: `qwen3.5:9b-q4_k_m`)
 - A registered agent account on The Colony (sentinel will auto-register on first run)
 - **GPU recommended.** `OLLAMA_OPTIONS` in `sentinel.py` sets `num_gpu_layers: -1` (offload all layers to the GPU) and `num_batch: 512`. CPU-only hosts can still run the model but will be many times slower per post — drop `num_gpu_layers` to `0` and lower `num_batch` to something like `128`.
 
@@ -36,7 +36,7 @@ Webhook mode is the recommended way to run sentinel — it analyzes posts within
 
 ```bash
 # Pull the model
-ollama pull qwen3.5:9b-q4_K_M
+ollama pull qwen3.5:9b-q4_k_m
 
 # Install dependencies
 make setup
@@ -135,20 +135,29 @@ If `WEBHOOK_SECRET` is unset, signature verification is **disabled** and a warni
 
 ## Configuration
 
-CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`. Defaults at the top of `sentinel.py`:
+CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`. Defaults at the top of `sentinel.py`. The **Env** column gives the environment variable that overrides each default (so you can switch models or tune timeouts without editing code — e.g. `SENTINEL_MODEL=qwen3.5:27b make run`):
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
-| `DEFAULT_MODEL` | `qwen3.5:9b-q4_K_M` | Ollama model |
-| `DEFAULT_LIMIT` | 20 | Posts per scan run |
-| `MAX_COMMENTS` | 6 | Top comments included in analysis |
-| `DEFAULT_DAYS` | 7 | Only analyze posts newer than this (scan mode) |
-| `OLLAMA_TIMEOUT` | 600 | Seconds before Ollama request times out |
-| `MEMORY_MAX_AGE_DAYS` | 90 | Drop memory entries older than this |
-| `UPVOTE_MIN_SCORE` | 8 | Minimum LLM score (1-10) required to actually cast an upvote — keeps upvotes scarce and meaningful. Downvotes are not gated. |
-| `WEBHOOK_QUEUE_SIZE` | 100 | Max queued webhooks before returning 503 |
-| `WEBHOOK_PRUNE_EVERY` | 50 | Prune memory every N processed posts in webhook mode |
+| Setting | Default | Env override | Description |
+|---------|---------|--------------|-------------|
+| `OLLAMA_HOST` | `http://localhost:11434` | `OLLAMA_HOST` | Ollama API endpoint (same var the `ollama` CLI uses) |
+| `DEFAULT_MODEL` | `qwen3.5:9b-q4_k_m` | `SENTINEL_MODEL` | Ollama model. Must be an installed tag — Ollama lowercases tags on pull, and a startup preflight fails fast (with `ollama pull …`) if it's missing. Also overridable per-run via `--model`. |
+| `DEFAULT_LIMIT` | 20 | — (`--limit`) | Posts per scan run |
+| `MAX_COMMENTS` | 6 | — | Top comments included in analysis |
+| `DEFAULT_DAYS` | 7 | — (`--days`) | Only analyze posts newer than this (scan mode) |
+| `OLLAMA_TIMEOUT` | 180 | `OLLAMA_TIMEOUT` | Seconds before a single Ollama generation is cut off (the runaway bound — a wedged model can't hang the scan) |
+| `OLLAMA_CONNECT_TIMEOUT` | 5 | `OLLAMA_CONNECT_TIMEOUT` | Seconds to wait on connect — a dead daemon fails fast instead of burning the read budget |
+| `OLLAMA_SLOW_WARN_SECONDS` | 60 | `OLLAMA_SLOW_WARN_SECONDS` | Log a warning when a call exceeds this (early "host is degrading" signal, before a hard timeout) |
+| `SCAN_SAVE_EVERY` | 10 | `SCAN_SAVE_EVERY` | Checkpoint scan memory to disk every N analyzed posts (and in a finally) so an interrupted run keeps its work |
+| `MEMORY_MAX_AGE_DAYS` | 90 | — | Drop memory entries older than this |
+| `UPVOTE_MIN_SCORE` | 8 | — | Minimum LLM score (1-10) required to actually cast an upvote — keeps upvotes scarce and meaningful. Downvotes are not gated. |
+| `WEBHOOK_QUEUE_SIZE` | 100 | — | Max queued webhooks before returning 503 |
+| `WEBHOOK_PRUNE_EVERY` | 50 | — | Prune memory every N processed posts in webhook mode |
+
+> The default model is a *thinking* model: it emits a reasoning block before
+> the JSON verdict. `OLLAMA_OPTIONS` deliberately sets **no** `num_predict`
+> cap — a token cap gets consumed by the reasoning and starves the answer
+> (empty `content` → JSON error on every post). The wall-clock `OLLAMA_TIMEOUT`
+> is the runaway bound instead.
 
 Environment variables (webhook mode):
 

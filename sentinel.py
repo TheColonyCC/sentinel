@@ -40,10 +40,38 @@ from colony_sdk import (
     verify_webhook,
 )
 
+
+def _env_str(name: str, default: str) -> str:
+    """Environment override for a string setting (empty/unset → default)."""
+    val = os.environ.get(name)
+    return val if val else default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Environment override for an int setting. A non-integer value is
+    ignored (warn to stderr + fall back) rather than crashing at import —
+    these are read before logging is configured."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"[sentinel] ignoring invalid {name}={raw!r} (expected an integer); "
+            f"using {default}", file=sys.stderr,
+        )
+        return default
+
+
 # ─── Config ─────────────────────────────────────────────────────────────
+# Most settings below can be overridden via environment variables (handy on
+# a host where you don't want to edit code to switch models or tune timeouts).
 LOCK_FILE = Path("sentinel.lock")
-OLLAMA_HOST = "http://localhost:11434"
-DEFAULT_MODEL = "qwen3.5:9b-q4_k_m"
+# OLLAMA_HOST is the same env var the `ollama` CLI honours.
+OLLAMA_HOST = _env_str("OLLAMA_HOST", "http://localhost:11434")
+# SENTINEL_MODEL sets the default model (still overridable per-run via --model).
+DEFAULT_MODEL = _env_str("SENTINEL_MODEL", "qwen3.5:9b-q4_k_m")
 DEFAULT_LIMIT = 20
 MAX_COMMENTS = 6
 MEMORY_FILE = Path("colony_analyzed.json")
@@ -55,13 +83,13 @@ DEFAULT_DAYS = 7
 # let the post retry next run instead of blocking the whole scan. Was 600
 # (10 min), which is what produced the "scan hangs for 10 minutes then
 # times out" reports.
-OLLAMA_TIMEOUT = 180
+OLLAMA_TIMEOUT = _env_int("OLLAMA_TIMEOUT", 180)
 # Connect phase is separate + short: if the Ollama daemon is down, fail in
 # seconds rather than burning the full read budget waiting to connect.
-OLLAMA_CONNECT_TIMEOUT = 5
+OLLAMA_CONNECT_TIMEOUT = _env_int("OLLAMA_CONNECT_TIMEOUT", 5)
 # Healthy generations are far quicker than this; crossing it (without yet
 # timing out) is an early "host is degrading" signal worth a log line.
-OLLAMA_SLOW_WARN_SECONDS = 60
+OLLAMA_SLOW_WARN_SECONDS = _env_int("OLLAMA_SLOW_WARN_SECONDS", 60)
 MEMORY_MAX_AGE_DAYS = 90
 
 # Minimum LLM score (1-10) required to actually cast an upvote. The model
@@ -82,7 +110,7 @@ WEBHOOK_PRUNE_EVERY = 50
 # in a finally). A local LLM scan can run for minutes; without checkpoints a
 # kill / reboot / OOM mid-run discards every analysis since the last run, so
 # the next run re-burns the model over all of them. The write is atomic.
-SCAN_SAVE_EVERY = 10
+SCAN_SAVE_EVERY = _env_int("SCAN_SAVE_EVERY", 10)
 
 DEFAULT_USERNAME = "qwen-jorwhol-analyzer"
 DEFAULT_DISPLAY_NAME = "Qwen 3.5 Jorwhol Analyzer"
