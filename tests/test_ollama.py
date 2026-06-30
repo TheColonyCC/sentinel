@@ -4,9 +4,10 @@ A wedged model used to hang a single scan for ten minutes — ``OLLAMA_TIMEOUT``
 was 600s and generation was unbounded — before timing out and giving up.
 These tests pin the guards that bound a scan:
 
-* a tight wall-clock read timeout (≈180s, was 600),
+* a tight wall-clock read timeout (≈180s, was 600) — the runaway bound,
 * a separate short connect timeout so a dead daemon fails fast,
-* a ``num_predict`` cap so a runaway decode can't burn the whole budget,
+* NO num_predict token cap (it starved the JSON answer on this thinking
+  model — see test_no_token_cap_starving_the_answer),
 * and that every failure mode returns ``None`` (post retries next run)
   rather than raising and killing the scan loop.
 """
@@ -32,11 +33,16 @@ def test_connect_timeout_is_short():
     assert 0 < s.OLLAMA_CONNECT_TIMEOUT <= 10
 
 
-def test_generation_is_capped():
-    # num_predict bounds tokens => bounds time; without it a runaway decode
-    # generates until the wall-clock timeout.
-    assert "num_predict" in s.OLLAMA_OPTIONS
-    assert 0 < s.OLLAMA_OPTIONS["num_predict"] <= 4096
+def test_no_token_cap_starving_the_answer():
+    # Regression: a num_predict cap (we tried 1024) gets consumed by the
+    # default model's <think> block, so message.content comes back empty and
+    # json.loads() fails on every post. The runaway bound is the wall-clock
+    # timeout, NOT a token cap — so there must be no positive num_predict.
+    np = s.OLLAMA_OPTIONS.get("num_predict")
+    assert np is None or np <= 0, (
+        "num_predict caps total tokens incl. reasoning; on a thinking model "
+        "it starves the JSON answer. Rely on OLLAMA_TIMEOUT instead."
+    )
 
 
 def test_slow_warn_below_timeout():
@@ -67,7 +73,7 @@ def test_passes_split_connect_read_timeout(monkeypatch: pytest.MonkeyPatch):
     assert captured["timeout"] == (s.OLLAMA_CONNECT_TIMEOUT, s.OLLAMA_TIMEOUT)
 
 
-def test_sends_num_predict_in_options(monkeypatch: pytest.MonkeyPatch):
+def test_sends_options_and_json_format(monkeypatch: pytest.MonkeyPatch):
     captured = {}
 
     def fake_post(url, json=None, timeout=None):
@@ -77,7 +83,11 @@ def test_sends_num_predict_in_options(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(s.requests, "post", fake_post)
     s.call_ollama("m", [{"role": "user", "content": "hi"}])
 
-    assert captured["json"]["options"]["num_predict"] == s.OLLAMA_OPTIONS["num_predict"]
+    # Options pass through, JSON-constrained output, and crucially no
+    # positive num_predict cap that would starve a thinking model's answer.
+    assert captured["json"]["options"] == s.OLLAMA_OPTIONS
+    assert captured["json"]["format"] == "json"
+    assert captured["json"]["options"].get("num_predict", 0) <= 0
 
 
 def test_happy_path_returns_parsed_json(monkeypatch: pytest.MonkeyPatch):
