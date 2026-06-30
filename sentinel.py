@@ -98,12 +98,13 @@ TEST_POSTS_COLONY = "test-posts"
 OLLAMA_OPTIONS = {
     "temperature": 0.3,
     "num_ctx": 16384,
-    # Hard cap on generated tokens. A moderation judgement is a small JSON
-    # object (a few hundred tokens at most, and ``format=json`` keeps the
-    # model on-task), so this is generous headroom — but it stops a runaway
-    # decode (the usual cause of a multi-minute scan) from generating until
-    # it hits the wall-clock timeout. Bounded tokens => bounded time.
-    "num_predict": 1024,
+    # NOTE: deliberately NO num_predict cap. The default model is a
+    # *thinking* model — it emits a <think> block before the JSON answer.
+    # A token cap (we briefly tried num_predict=1024) gets consumed by the
+    # reasoning and starves the answer: message.content comes back empty
+    # and json.loads() fails on every post ("Expecting value: line 1
+    # column 1"). The runaway-generation bound is the OLLAMA_TIMEOUT
+    # wall-clock (180s), not a token cap.
     "keep_alive": "30m",
     "num_gpu_layers": -1,
     "num_batch": 512,
