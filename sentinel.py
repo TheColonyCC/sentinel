@@ -78,6 +78,11 @@ WEBHOOK_QUEUE_SIZE = 100
 # Prune memory every N processed posts in webhook mode (scan mode prunes on
 # every run).
 WEBHOOK_PRUNE_EVERY = 50
+# Checkpoint scan-mode memory to disk every N newly-analyzed posts (and again
+# in a finally). A local LLM scan can run for minutes; without checkpoints a
+# kill / reboot / OOM mid-run discards every analysis since the last run, so
+# the next run re-burns the model over all of them. The write is atomic.
+SCAN_SAVE_EVERY = 10
 
 DEFAULT_USERNAME = "qwen-jorwhol-analyzer"
 DEFAULT_DISPLAY_NAME = "Qwen 3.5 Jorwhol Analyzer"
@@ -887,11 +892,82 @@ def log_results(results: list[dict]) -> None:
 
 
 # ─── Scan mode (one-shot) ───────────────────────────────────────────────
+def ensure_model_available(model: str) -> None:
+    """Abort early if the requested model isn't pulled into Ollama.
+
+    The startup preflight only confirms the daemon is reachable. If the
+    model itself is missing, every ``call_ollama`` would just return None
+    and the whole run would silently do nothing but log per-post errors —
+    so fail loudly here with the exact fix instead.
+    """
+    try:
+        resp = requests.get(
+            f"{OLLAMA_HOST}/api/tags", timeout=OLLAMA_CONNECT_TIMEOUT)
+        resp.raise_for_status()
+        models = resp.json().get("models", []) or []
+    except Exception as e:
+        logger.error("Could not query Ollama models at %s: %s", OLLAMA_HOST, e)
+        sys.exit(1)
+    names = {m.get("name", "") for m in models}
+    # Ollama tags carry an explicit ":tag" (e.g. "qwen3.5:9b-q4_K_M"); a bare
+    # name defaults to ":latest". Accept an exact match, the implicit :latest
+    # form, or a base-name match.
+    bases = {n.split(":", 1)[0] for n in names}
+    if model in names or f"{model}:latest" in names or model in bases:
+        return
+    available = ", ".join(sorted(n for n in names if n)) or "(none installed)"
+    logger.error(
+        "Ollama model %r is not available. Pull it with:  ollama pull %s  "
+        "(installed: %s)", model, model, available,
+    )
+    sys.exit(1)
+
+
+def _process_post(
+    client: ColonyClient,
+    post_data: dict,
+    args: argparse.Namespace,
+    memory: dict,
+    results: list[dict],
+) -> bool:
+    """Analyze one already-fetched post, record it in ``memory`` +
+    ``results``, and apply its moderation actions.
+
+    Shared by the single-post (``--post-id``) and bulk-scan paths so the two
+    can't drift. Returns True when the post was analyzed; False when the
+    model call failed (caller leaves it unrecorded to retry next run).
+    """
+    post_id = post_data["post"].get("id")
+    judgement = analyze_post(post_data, args.model)
+    if judgement is None:
+        return False
+
+    judgement["analyzed_at"] = datetime.now().isoformat()
+    results.append(judgement)
+    memory[post_id] = judgement
+
+    if not args.dry_run:
+        failed = act_on_judgement(
+            client,
+            post_id,
+            judgement,
+            allow_vote=not args.no_vote,
+            allow_pii=not args.no_pii,
+            confirm=args.confirm,
+        )
+        if failed:
+            judgement["_pending_actions"] = failed
+    return True
+
+
 def cmd_scan(args: argparse.Namespace) -> None:
     logger.info("Sentinel — scan mode")
     if args.dry_run:
         args.no_vote = True
         args.no_pii = True
+
+    # Fail fast if the model isn't pulled rather than silently no-op'ing.
+    ensure_model_available(args.model)
 
     username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
     client, config = get_or_register_client(username)
@@ -909,80 +985,61 @@ def cmd_scan(args: argparse.Namespace) -> None:
     results: list[dict] = []
     new_analyses = 0
 
-    if args.post_id:
-        data = fetch_post_with_comments(client, args.post_id)
-        if data is None:
-            logger.error("Could not fetch post — aborting")
-            sys.exit(1)
-        judgement = analyze_post(data, args.model)
-        if judgement:
-            judgement["analyzed_at"] = datetime.now().isoformat()
-            results.append(judgement)
-            memory[args.post_id] = judgement
-            new_analyses += 1
-            if not args.dry_run:
-                failed = act_on_judgement(
-                    client,
-                    args.post_id,
-                    judgement,
-                    allow_vote=not args.no_vote,
-                    allow_pii=not args.no_pii,
-                    confirm=args.confirm,
-                )
-                if failed:
-                    judgement["_pending_actions"] = failed
-    else:
-        try:
-            posts = list(client.iter_posts(sort=args.sort, max_results=args.limit))
-        except ColonyAPIError as e:
-            logger.error("Failed to fetch posts: %s", e)
-            sys.exit(1)
+    def _checkpoint() -> None:
+        if not args.dry_run:
+            save_memory(memory)
 
-        for post in posts:
-            post_id = post.get("id")
-            title = (post.get("title") or "")[:70]
-            created_at = post.get("created_at")
-
-            if not post_id:
-                continue
-            if post_id in processed and not args.force:
-                logger.debug("Skipping (already analyzed): %s %s", post_id[:8], title)
-                continue
-            if not is_within_days(created_at or "", args.days):
-                logger.debug("Skipping (older than %d days): %s %s", args.days, post_id[:8], title)
-                continue
-            if (post.get("author") or {}).get("username", "") == config.get("username"):
-                logger.debug("Skipping (own post): %s %s", post_id[:8], title)
-                continue
-
-            logger.info("Analyzing %s: %s", post_id[:8], title)
-            data = fetch_post_with_comments(client, post_id)
+    try:
+        if args.post_id:
+            data = fetch_post_with_comments(client, args.post_id)
             if data is None:
-                continue
-            judgement = analyze_post(data, args.model)
-            if judgement is None:
-                logger.warning("Analysis failed — will retry next run")
-                continue
+                logger.error("Could not fetch post — aborting")
+                sys.exit(1)
+            if _process_post(client, data, args, memory, results):
+                new_analyses += 1
+        else:
+            try:
+                posts = list(client.iter_posts(sort=args.sort, max_results=args.limit))
+            except ColonyAPIError as e:
+                logger.error("Failed to fetch posts: %s", e)
+                sys.exit(1)
 
-            judgement["analyzed_at"] = datetime.now().isoformat()
-            results.append(judgement)
-            memory[post_id] = judgement
-            new_analyses += 1
+            for post in posts:
+                post_id = post.get("id")
+                title = (post.get("title") or "")[:70]
+                created_at = post.get("created_at")
 
-            if not args.dry_run:
-                failed = act_on_judgement(
-                    client,
-                    post_id,
-                    judgement,
-                    allow_vote=not args.no_vote,
-                    allow_pii=not args.no_pii,
-                    confirm=args.confirm,
-                )
-                if failed:
-                    judgement["_pending_actions"] = failed
+                if not post_id:
+                    continue
+                if post_id in processed and not args.force:
+                    logger.debug("Skipping (already analyzed): %s %s", post_id[:8], title)
+                    continue
+                if not is_within_days(created_at or "", args.days):
+                    logger.debug("Skipping (older than %d days): %s %s", args.days, post_id[:8], title)
+                    continue
+                if (post.get("author") or {}).get("username", "") == config.get("username"):
+                    logger.debug("Skipping (own post): %s %s", post_id[:8], title)
+                    continue
+
+                logger.info("Analyzing %s: %s", post_id[:8], title)
+                data = fetch_post_with_comments(client, post_id)
+                if data is None:
+                    continue
+                if not _process_post(client, data, args, memory, results):
+                    logger.warning("Analysis failed — will retry next run")
+                    continue
+
+                new_analyses += 1
+                # Checkpoint periodically so an interrupted scan keeps its
+                # finished work instead of re-analyzing it on the next run.
+                if new_analyses % SCAN_SAVE_EVERY == 0:
+                    _checkpoint()
+                    logger.debug("Checkpointed memory after %d new analyses", new_analyses)
+    finally:
+        # Always persist what we finished — even on Ctrl-C / crash / sys.exit.
+        _checkpoint()
 
     if not args.dry_run:
-        save_memory(memory)
         logger.info("Memory updated: %d posts (added %d new)", len(memory), new_analyses)
     else:
         logger.info("Dry run — memory not saved (%d posts analyzed)", new_analyses)
@@ -1236,6 +1293,10 @@ def make_webhook_handler(
 
 def cmd_webhook(args: argparse.Namespace) -> None:
     logger.info("Sentinel — webhook mode")
+
+    # Fail fast if the model isn't pulled — otherwise the server would accept
+    # webhooks and silently fail every analysis.
+    ensure_model_available(args.model)
 
     username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
     client, config = get_or_register_client(username)
