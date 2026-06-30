@@ -25,6 +25,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -48,7 +49,19 @@ MAX_COMMENTS = 6
 MEMORY_FILE = Path("colony_analyzed.json")
 CONFIG_FILE = Path("colony_config.json")
 DEFAULT_DAYS = 7
-OLLAMA_TIMEOUT = 600
+# A healthy post scan finishes in seconds. If a single Ollama generation
+# runs longer than this, the model has almost certainly wedged (runaway
+# generation / stuck decode) rather than doing real work — cut it off and
+# let the post retry next run instead of blocking the whole scan. Was 600
+# (10 min), which is what produced the "scan hangs for 10 minutes then
+# times out" reports.
+OLLAMA_TIMEOUT = 180
+# Connect phase is separate + short: if the Ollama daemon is down, fail in
+# seconds rather than burning the full read budget waiting to connect.
+OLLAMA_CONNECT_TIMEOUT = 5
+# Healthy generations are far quicker than this; crossing it (without yet
+# timing out) is an early "host is degrading" signal worth a log line.
+OLLAMA_SLOW_WARN_SECONDS = 60
 MEMORY_MAX_AGE_DAYS = 90
 
 # Minimum LLM score (1-10) required to actually cast an upvote. The model
@@ -80,6 +93,12 @@ TEST_POSTS_COLONY = "test-posts"
 OLLAMA_OPTIONS = {
     "temperature": 0.3,
     "num_ctx": 16384,
+    # Hard cap on generated tokens. A moderation judgement is a small JSON
+    # object (a few hundred tokens at most, and ``format=json`` keeps the
+    # model on-task), so this is generous headroom — but it stops a runaway
+    # decode (the usual cause of a multi-minute scan) from generating until
+    # it hits the wall-clock timeout. Bounded tokens => bounded time.
+    "num_predict": 1024,
     "keep_alive": "30m",
     "num_gpu_layers": -1,
     "num_batch": 512,
@@ -508,19 +527,40 @@ def call_ollama(model: str, messages: list[dict]) -> dict | None:
         "format": "json",
         "options": OLLAMA_OPTIONS,
     }
+    started = time.monotonic()
     try:
-        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
+        resp = requests.post(
+            f"{OLLAMA_HOST}/api/chat", json=payload,
+            # (connect, read): a dead daemon fails in ~5s; a wedged model
+            # is cut off at OLLAMA_TIMEOUT instead of hanging the scan.
+            timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_TIMEOUT),
+        )
         if resp.status_code == 500:
             logger.error("Ollama 500 — try: pkill ollama && ollama serve")
             return None
         resp.raise_for_status()
-        return json.loads(resp.json()["message"]["content"].strip())
+        parsed = json.loads(resp.json()["message"]["content"].strip())
     except requests.exceptions.Timeout:
-        logger.warning("Ollama timeout — post will retry next run")
+        logger.warning(
+            "Ollama timed out after %ds — model likely wedged (runaway "
+            "decode); post will retry next run", OLLAMA_TIMEOUT,
+        )
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error("Ollama unreachable at %s — is the daemon up? (%s)", OLLAMA_HOST, e)
         return None
     except Exception as e:
         logger.error("Ollama error: %s", e)
         return None
+    elapsed = time.monotonic() - started
+    if elapsed > OLLAMA_SLOW_WARN_SECONDS:
+        # Not yet a timeout, but a healthy scan is seconds, not minutes —
+        # surface the degradation before it becomes a hard timeout.
+        logger.warning(
+            "Ollama call took %.0fs (healthy scans are well under %ds) — "
+            "host may be under load or swapping", elapsed, OLLAMA_SLOW_WARN_SECONDS,
+        )
+    return parsed
 
 
 # ─── Post fetch + analysis ──────────────────────────────────────────────
