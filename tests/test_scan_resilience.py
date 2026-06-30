@@ -43,6 +43,18 @@ class TestEnsureModelAvailable:
                             lambda *a, **k: _tags_response(["llama3:latest"]))
         s.ensure_model_available("llama3")  # base name matches
 
+    def test_case_insensitive_match_ok(self, monkeypatch):
+        # Ollama lowercases tags on pull: a configured "...q4_K_M" must match
+        # an installed "...q4_k_m" (the regression that 500'd `make run`).
+        monkeypatch.setattr(s.requests, "get",
+                            lambda *a, **k: _tags_response(["qwen3.5:9b-q4_k_m"]))
+        s.ensure_model_available("qwen3.5:9b-q4_K_M")  # no raise
+
+    def test_default_model_is_lowercase(self):
+        # The default must be an exact installed tag, not a casing Ollama
+        # would never store.
+        assert s.DEFAULT_MODEL == s.DEFAULT_MODEL.lower()
+
     def test_implicit_latest_ok(self, monkeypatch):
         monkeypatch.setattr(s.requests, "get",
                             lambda *a, **k: _tags_response(["llama3:latest"]))
