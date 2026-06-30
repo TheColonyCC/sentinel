@@ -43,7 +43,7 @@ from colony_sdk import (
 # ─── Config ─────────────────────────────────────────────────────────────
 LOCK_FILE = Path("sentinel.lock")
 OLLAMA_HOST = "http://localhost:11434"
-DEFAULT_MODEL = "qwen3.5:9b-q4_K_M"
+DEFAULT_MODEL = "qwen3.5:9b-q4_k_m"
 DEFAULT_LIMIT = 20
 MAX_COMMENTS = 6
 MEMORY_FILE = Path("colony_analyzed.json")
@@ -909,14 +909,18 @@ def ensure_model_available(model: str) -> None:
     except Exception as e:
         logger.error("Could not query Ollama models at %s: %s", OLLAMA_HOST, e)
         sys.exit(1)
-    names = {m.get("name", "") for m in models}
-    # Ollama tags carry an explicit ":tag" (e.g. "qwen3.5:9b-q4_K_M"); a bare
-    # name defaults to ":latest". Accept an exact match, the implicit :latest
-    # form, or a base-name match.
+    raw_names = [m.get("name", "") for m in models if m.get("name")]
+    # Match case-insensitively: Ollama normalizes tags to lowercase on pull
+    # (so a configured "qwen3.5:9b-q4_K_M" must match an installed
+    # "qwen3.5:9b-q4_k_m"). Tags carry an explicit ":tag"; a bare name
+    # defaults to ":latest". Accept an exact match, the implicit :latest
+    # form, or a base-name match for a bare request.
+    names = {n.lower() for n in raw_names}
     bases = {n.split(":", 1)[0] for n in names}
-    if model in names or f"{model}:latest" in names or model in bases:
+    want = model.lower()
+    if want in names or f"{want}:latest" in names or want in bases:
         return
-    available = ", ".join(sorted(n for n in names if n)) or "(none installed)"
+    available = ", ".join(sorted(raw_names)) or "(none installed)"
     logger.error(
         "Ollama model %r is not available. Pull it with:  ollama pull %s  "
         "(installed: %s)", model, model, available,
