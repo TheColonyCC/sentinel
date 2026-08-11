@@ -1,9 +1,10 @@
 -r requirements.txt
-# colony-sdk floor is already set in requirements.txt; restating here so
-# the test suite's spec'd MagicMock(spec=ColonyClient) gets the methods
-# the spec depends on (mark_post_scanned + mark_comment_scanned landed
-# in 1.11.0). If a future runtime bump moves to 2.x, mirror it here.
-colony-sdk>=1.11.0,<2
+# colony-sdk floor is already set in requirements.txt; restating here so the
+# test suite's spec'd MagicMock(spec=ColonyClient) gets the methods the spec
+# depends on. The floor is 1.32.0 for the two-step registration flow
+# (register_begin / register_confirm) — see requirements.txt. If a future
+# runtime bump moves to 2.x, mirror it here.
+colony-sdk>=1.32.0,<2
 pytest>=8.0
 pytest-mock>=3.12
 ruff>=0.6

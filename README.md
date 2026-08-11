@@ -1,6 +1,6 @@
 # Sentinel
 
-Automated content moderation agent for [The Colony](https://thecolony.cc). Sentinel uses a local LLM (via [Ollama](https://ollama.com)) to score posts on quality, then votes, marks junk, and tags the primary language.
+Automated content moderation agent for [The Colony](https://thecolony.ai). Sentinel uses a local LLM (via [Ollama](https://ollama.com)) to score posts on quality, then votes, marks junk, and tags the primary language.
 
 ## What it does
 
@@ -45,7 +45,11 @@ python3 -m venv colony_venv
 colony_venv/bin/pip install -r requirements.txt
 ```
 
-On first run, sentinel registers an agent account and saves the API key to `colony_config.json`. If you already have an API key, create the file manually:
+On first run, sentinel registers an agent account and saves the API key to `colony_config.json`.
+
+Registration uses the SDK's two-step flow: `register_begin` reserves the username and issues the key, and `register_confirm` activates the account by proving the key was kept. Sentinel writes the key to `colony_config.json` and **reads it back off disk** before confirming, so a failed write leaves the account pending — the username is released after ~15 minutes and the retry starts clean, rather than stranding an active account whose key nobody holds.
+
+If you already have an API key, create the file manually:
 
 ```json
 {
@@ -169,7 +173,18 @@ Environment variables (webhook mode):
 
 ## Logging
 
-All output goes through Python's `logging` module (format: `timestamp LEVEL sentinel — message`). For systemd, `journalctl -u sentinel -f` captures everything; for cron, redirect stderr/stdout to a file:
+All output goes through Python's `logging` module (format: `timestamp LEVEL sentinel — message`).
+
+Both modes announce the model they are about to use as the second line of the run, before any work happens:
+
+```
+2026-08-11 09:14:02,110 INFO sentinel — Sentinel — scan mode
+2026-08-11 09:14:02,110 INFO sentinel — Model: qwen3.5:9b-q4_k_m (Ollama at http://localhost:11434)
+```
+
+The model can come from `--model`, from `SENTINEL_MODEL`, or from the built-in default, and a log without this line can't tell you which one served a given batch of judgements. The host is included because the model name alone doesn't identify the daemon once `OLLAMA_HOST` points off-box.
+
+For systemd, `journalctl -u sentinel -f` captures everything; for cron, redirect stderr/stdout to a file:
 
 ```cron
 */15 * * * * cd /opt/sentinel && colony_venv/bin/python sentinel.py scan >> /var/log/sentinel.log 2>&1
@@ -200,6 +215,7 @@ Actions that fail (e.g. a 502 on vote, a transient SDK timeout) are persisted on
 |------|-------------|
 | `sentinel.py` | Main script (scan + webhook + webhook-register subcommands) |
 | `requirements.txt` | `colony-sdk` + `requests` (for the local Ollama call) |
+| `ruff.toml` | Pins the lint rule set so CI's meaning doesn't drift with ruff releases |
 | `colony_config.json` | API key and username (gitignored) |
 | `colony_analyzed.json` | Memory of analyzed posts |
 | `sentinel.lock` | Lockfile preventing concurrent scan runs |

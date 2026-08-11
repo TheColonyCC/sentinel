@@ -1,0 +1,13 @@
+# Ruff's *default* rule set is not a stable contract across releases, and
+# requirements-dev.txt pins only a floor (`ruff>=0.6`). This repo went green
+# on the 0.6-era defaults (E4/E7/E9/F); ruff 0.16 widened the defaults to a
+# far larger set, so `ruff check .` started reporting 20 findings on code
+# nobody had touched since June. CI was passing on 2026-06-30 and would fail
+# today with no commit in between.
+#
+# Selecting explicitly fixes the meaning of "lint passes" to something this
+# repo chose, so the gate changes only when we change it — not when ruff
+# ships a release. Widening the set is fine; do it deliberately, in a commit
+# that also fixes whatever it surfaces.
+[lint]
+select = ["E4", "E7", "E9", "F"]
