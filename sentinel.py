@@ -115,7 +115,7 @@ SCAN_SAVE_EVERY = _env_int("SCAN_SAVE_EVERY", 10)
 DEFAULT_USERNAME = "qwen-jorwhol-analyzer"
 DEFAULT_DISPLAY_NAME = "Qwen 3.5 Jorwhol Analyzer"
 DEFAULT_BIO = (
-    "Local Qwen 3.5 moderator that scores, votes, and sets language on TheColony.cc posts."
+    "Local Qwen 3.5 moderator that scores, votes, and sets language on TheColony.ai posts."
 )
 
 # Slug of the canonical sandbox colony posts get relocated into when the LLM
@@ -139,7 +139,7 @@ OLLAMA_OPTIONS = {
     "num_thread": 0,
 }
 
-SYSTEM_PROMPT = """You are an expert moderator for TheColony.cc, a high-signal collaborative platform for AI agents and humans.
+SYSTEM_PROMPT = """You are an expert moderator for TheColony.ai, a high-signal collaborative platform for AI agents and humans.
 Your job is to evaluate posts and their replies for quality, originality, relevance, and value to the community.
 You must also detect the primary language of the post and flag any personally identifiable information (PII).
 
@@ -297,6 +297,84 @@ def is_within_days(created_at: str, days: int) -> bool:
 
 
 # ─── Colony client setup ────────────────────────────────────────────────
+AGENT_CAPABILITIES = {
+    "skills": ["analysis", "moderation", "voting", "language-tagging"]
+}
+
+
+def register_agent(username: str, config: dict) -> str:
+    """Register a new agent and return its API key, saving it to ``config``.
+
+    colony-sdk dropped the one-shot ``ColonyClient.register`` in favour of a
+    two-step ``register_begin`` / ``register_confirm`` flow. ``register_begin``
+    mints a *pending* account that cannot post, vote, or DM; ``register_confirm``
+    activates it by proving the caller still holds the key it was handed.
+
+    The ordering below is therefore load-bearing: persist the key, read it back
+    off disk, and only then confirm. Confirming first would activate an account
+    whose key might never have reached durable storage — precisely the failure
+    the gate exists to catch. Bailing out before confirm leaves the account
+    pending, which releases the username after ~15 minutes so the retry is
+    clean rather than colliding with a half-made account.
+    """
+    logger.info("Registering new agent @%s (1/2: reserving the username)", username)
+    try:
+        begun = ColonyClient.register_begin(
+            username=username,
+            display_name=DEFAULT_DISPLAY_NAME,
+            bio=DEFAULT_BIO,
+            capabilities=AGENT_CAPABILITIES,
+        )
+    except ColonyAPIError as e:
+        logger.error("Registration failed: %s", e)
+        sys.exit(1)
+
+    api_key = begun.get("api_key")
+    claim_token = begun.get("claim_token")
+    if not api_key or not claim_token:
+        missing = "api_key" if not api_key else "claim_token"
+        logger.error("register_begin returned no %s — cannot continue", missing)
+        sys.exit(1)
+
+    config["api_key"] = api_key
+    config["username"] = username
+    save_config(config)
+
+    # Read back rather than trusting the write. The confirm step is an
+    # assertion that the key survived somewhere durable, so the thing we
+    # confirm with has to be the thing that actually landed on disk.
+    persisted = load_config().get("api_key")
+    if not persisted or persisted != api_key:
+        logger.error(
+            "API key did not survive the write to %s — leaving the account "
+            "pending so the username is released and a retry starts clean",
+            CONFIG_FILE,
+        )
+        sys.exit(1)
+
+    logger.info("Activating @%s (2/2: confirming the saved key)", username)
+    try:
+        # The fingerprint is the last 6 chars of the key — non-secret by
+        # construction, and never logged.
+        ColonyClient.register_confirm(claim_token, persisted[-6:])
+    except ColonyAPIError as e:
+        if getattr(e, "code", None) == "REGISTER_ALREADY_ACTIVE":
+            # Idempotent guard: a previous run confirmed but died before it
+            # could record success. The account is usable; carry on.
+            logger.info("Account @%s was already active", username)
+            return api_key
+        logger.error(
+            "Activation failed (%s). The account exists but is INACTIVE. Its "
+            "key is saved in %s and the claim window is ~15 minutes; after "
+            "that the username is released and you can re-run to start over.",
+            e, CONFIG_FILE,
+        )
+        sys.exit(1)
+
+    logger.info("Agent registered and active as @%s", username)
+    return api_key
+
+
 def get_or_register_client(username: str) -> tuple[ColonyClient, dict]:
     """Return an authenticated ColonyClient, registering a new agent if needed.
 
@@ -307,24 +385,7 @@ def get_or_register_client(username: str) -> tuple[ColonyClient, dict]:
     api_key = config.get("api_key")
 
     if not api_key:
-        logger.info("Registering new agent @%s", username)
-        try:
-            data = ColonyClient.register(
-                username=username,
-                display_name=DEFAULT_DISPLAY_NAME,
-                bio=DEFAULT_BIO,
-                capabilities={
-                    "skills": ["analysis", "moderation", "voting", "language-tagging"]
-                },
-            )
-        except ColonyAPIError as e:
-            logger.error("Registration failed: %s", e)
-            sys.exit(1)
-        api_key = data["api_key"]
-        config["api_key"] = api_key
-        config["username"] = username
-        save_config(config)
-        logger.info("Agent registered as @%s", username)
+        api_key = register_agent(username, config)
 
     return ColonyClient(api_key=api_key), config
 
@@ -920,7 +981,20 @@ def log_results(results: list[dict]) -> None:
         )
 
 
-# ─── Scan mode (one-shot) ───────────────────────────────────────────────
+# ─── Model preflight ────────────────────────────────────────────────────
+def log_model_in_use(model: str) -> None:
+    """Announce the model this run will use, before any work happens.
+
+    Which model actually ran is the first thing you want out of a log when a
+    scan's judgements look wrong — and it is not recoverable after the fact,
+    because the model can come from ``--model``, from ``SENTINEL_MODEL``, or
+    from the built-in default, and the three leave no trace apart from this
+    line. The Ollama host goes with it: the model name alone doesn't say which
+    daemon served it, which matters as soon as ``OLLAMA_HOST`` points off-box.
+    """
+    logger.info("Model: %s (Ollama at %s)", model, OLLAMA_HOST)
+
+
 def ensure_model_available(model: str) -> None:
     """Abort early if the requested model isn't pulled into Ollama.
 
@@ -995,6 +1069,7 @@ def _process_post(
 
 def cmd_scan(args: argparse.Namespace) -> None:
     logger.info("Sentinel — scan mode")
+    log_model_in_use(args.model)
     if args.dry_run:
         args.no_vote = True
         args.no_pii = True
@@ -1326,6 +1401,7 @@ def make_webhook_handler(
 
 def cmd_webhook(args: argparse.Namespace) -> None:
     logger.info("Sentinel — webhook mode")
+    log_model_in_use(args.model)
 
     # Fail fast if the model isn't pulled — otherwise the server would accept
     # webhooks and silently fail every analysis.

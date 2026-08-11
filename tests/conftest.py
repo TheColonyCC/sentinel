@@ -50,10 +50,11 @@ def mock_client() -> MagicMock:
     a test (``client.voot_post`` instead of ``client.vote_post``) is
     surfaced as ``AttributeError`` immediately rather than silently
     succeeding on a MagicMock that auto-creates the attribute.
-    Requires ``colony-sdk>=1.11.0`` (pinned in ``requirements-dev.txt``)
+    Requires ``colony-sdk>=1.32.0`` (pinned in ``requirements-dev.txt``)
     so that the sentinel-side helpers added in 1.11.0
     (``mark_post_scanned``, ``mark_comment_scanned``) are part of the
-    spec.
+    spec. The floor moved to 1.32.0 with the two-step registration flow
+    — see ``requirements.txt``.
 
     Tests override individual return values by reassigning
     ``client.vote_post.return_value = ...`` etc. or set

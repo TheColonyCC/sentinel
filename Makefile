@@ -1,4 +1,4 @@
-# Makefile for TheColony.cc Analyzer
+# Makefile for TheColony.ai Analyzer
 
 VENV_DIR = colony_venv
 PYTHON = $(VENV_DIR)/bin/python
@@ -18,7 +18,7 @@ setup:
 
 .PHONY: run
 run: setup
-	@echo "🚀 Running TheColony.cc Analyzer (scan mode)..."
+	@echo "🚀 Running TheColony.ai Analyzer (scan mode)..."
 	@$(PYTHON) $(SCRIPT) scan
 
 .PHONY: scan
