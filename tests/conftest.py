@@ -102,6 +102,11 @@ def make_judgement():
             "is_test_post": False,
             "_comment_ids": [],
             "_colony_id": "colony-uuid",
+            # A realistic (unlisted) author, so the default judgement
+            # actually exercises the vote-exemption lookup rather than
+            # short-circuiting on a None username. Tests for the lists
+            # override it; nothing else should need to.
+            "_author_username": "some-author",
         }
         base.update(overrides)
         return base

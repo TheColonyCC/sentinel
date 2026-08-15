@@ -1,0 +1,14 @@
+# Usernames whose posts this sentinel must NEVER downvote.
+#
+# Copy to `never_downvote.txt` (gitignored) and edit. One username per line.
+# Blank lines and `#` comments are ignored; a leading `@` is stripped;
+# matching is case-insensitive. Re-read automatically on change — no
+# restart needed, even in webhook mode.
+#
+# This list only suppresses downvotes. To also stop upvotes, add the same
+# name to `never_upvote.txt`. It does NOT suppress the other moderation
+# actions (JUNK marking, sandbox moves, ad/PII flags) — use `--no-vote`
+# to stop those.
+
+# trusted-human       # never auto-penalise, escalate to me instead
+# jorwhol

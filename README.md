@@ -154,6 +154,8 @@ CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`.
 | `SCAN_SAVE_EVERY` | 10 | `SCAN_SAVE_EVERY` | Checkpoint scan memory to disk every N analyzed posts (and in a finally) so an interrupted run keeps its work |
 | `MEMORY_MAX_AGE_DAYS` | 90 | — | Drop memory entries older than this |
 | `UPVOTE_MIN_SCORE` | 8 | — | Minimum LLM score (1-10) required to actually cast an upvote — keeps upvotes scarce and meaningful. Downvotes are not gated. |
+| `NEVER_UPVOTE_FILE` | `never_upvote.txt` | `SENTINEL_NEVER_UPVOTE_FILE` | Local list of usernames never to upvote — see [Vote-exemption lists](#vote-exemption-lists) |
+| `NEVER_DOWNVOTE_FILE` | `never_downvote.txt` | `SENTINEL_NEVER_DOWNVOTE_FILE` | Local list of usernames never to downvote |
 | `WEBHOOK_QUEUE_SIZE` | 100 | — | Max queued webhooks before returning 503 |
 | `WEBHOOK_PRUNE_EVERY` | 50 | — | Prune memory every N processed posts in webhook mode |
 
@@ -170,6 +172,45 @@ Environment variables (webhook mode):
 | `WEBHOOK_SECRET` | — | HMAC secret shared with The Colony (16+ chars) |
 | `WEBHOOK_PORT` | `8000` | Port to listen on |
 | `WEBHOOK_PATH` | `/webhook` | URL path for the webhook endpoint |
+
+## Vote-exemption lists
+
+Two optional files on the sentinel's own filesystem name users this instance must never vote on:
+
+| File | Effect |
+|------|--------|
+| `never_upvote.txt` | Posts by these users are never upvoted |
+| `never_downvote.txt` | Posts by these users are never downvoted |
+
+Both are **gitignored** — they are local policy for one box, not something to publish. Copy the shipped templates to get started:
+
+```bash
+cp never_downvote.txt.example never_downvote.txt
+$EDITOR never_downvote.txt
+```
+
+Format: one username per line. Blank lines and `#` comments (whole-line or trailing) are ignored, a leading `@` is stripped so a pasted mention works, and matching is case-insensitive.
+
+```
+# never auto-penalise these — escalate to me instead
+trusted-human
+@jorwhol          # pasted mentions work
+```
+
+Notes worth knowing before you rely on them:
+
+- **The two lists are independent.** Listing someone under `never_downvote.txt` does *not* stop upvotes. To exempt a user from voting entirely, add the name to both files. This is deliberate — the common case is "don't let a local model penalise this account unattended", and the arm's-length case ("don't let my own agent boost my other account") is the opposite direction. Collapsing them into one list would take away the ability to express either alone.
+- **An exemption suppresses the vote and nothing else.** A JUNK post by a listed user is still marked junk, still gets its language tagged, still gets PII-flagged, and is still marked scanned. Use `--no-vote` if you want to stop the whole moderation family.
+- **Edits take effect immediately.** The files are re-read whenever they change, so you can add a name while a long-running `webhook` process is up without restarting it.
+- **Sentinel resolves these paths relative to the working directory**, the same as `colony_config.json` and `colony_analyzed.json`. Both modes log the absolute path they consulted at startup, so a list sitting in the wrong directory is visible in the log rather than silently inert:
+
+  ```
+  INFO sentinel — Vote exemptions — never-upvote: not present (/opt/sentinel/never_upvote.txt)
+  INFO sentinel — Vote exemptions — never-downvote: 2 entries (/opt/sentinel/never_downvote.txt)
+  ```
+
+  Point them elsewhere with `SENTINEL_NEVER_UPVOTE_FILE` / `SENTINEL_NEVER_DOWNVOTE_FILE`.
+- **One bounded gap.** A vote that failed and was persisted to `_pending_actions` by a sentinel *older* than this feature carries no author, so it can't be re-checked when it replays. Such a vote is cast. The queue drains within 5 attempts, so this only spans the first few runs after upgrading. Votes queued by this version onward carry the author and are re-checked against the list **as it stands at replay time** — so listing a user also stops a vote that was already queued for them.
 
 ## Logging
 
@@ -217,6 +258,7 @@ Actions that fail (e.g. a 502 on vote, a transient SDK timeout) are persisted on
 | `requirements.txt` | `colony-sdk` + `requests` (for the local Ollama call) |
 | `ruff.toml` | Pins the lint rule set so CI's meaning doesn't drift with ruff releases |
 | `colony_config.json` | API key and username (gitignored) |
+| `never_upvote.txt` / `never_downvote.txt` | Local [vote-exemption lists](#vote-exemption-lists) (gitignored; `.example` templates are committed) |
 | `colony_analyzed.json` | Memory of analyzed posts |
 | `sentinel.lock` | Lockfile preventing concurrent scan runs |
 | `Makefile` | Convenience targets |

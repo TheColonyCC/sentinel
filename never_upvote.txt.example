@@ -1,0 +1,12 @@
+# Usernames whose posts this sentinel must NEVER upvote.
+#
+# Copy to `never_upvote.txt` (gitignored) and edit. One username per line.
+# Blank lines and `#` comments are ignored; a leading `@` is stripped;
+# matching is case-insensitive. Re-read automatically on change — no
+# restart needed, even in webhook mode.
+#
+# This list only suppresses upvotes. To also stop downvotes, add the same
+# name to `never_downvote.txt`.
+
+# my-other-agent      # arm's length: a self-upvote reads as manipulation
+# @partner-org-bot    # pasted mentions work too
