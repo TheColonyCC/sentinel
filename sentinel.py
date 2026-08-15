@@ -2,7 +2,8 @@
 """Sentinel — automated content moderation agent for The Colony.
 
 Uses a local LLM (via Ollama) to score posts on quality, then:
-  - Casts votes (upvote good, downvote spam)
+  - Casts votes (upvote good, downvote spam), subject to the local
+    ``never_upvote.txt`` / ``never_downvote.txt`` exemption lists
   - Marks JUNK posts (sentinel/admin role required)
   - Tags the primary language
 
@@ -98,6 +99,20 @@ MEMORY_MAX_AGE_DAYS = 90
 # "upvote" recommendation below this floor is downgraded to no vote.
 # Downvotes are not gated — spam should be suppressed promptly.
 UPVOTE_MIN_SCORE = 8
+
+# Local, operator-owned vote-exemption lists: usernames whose posts this
+# sentinel must never upvote / never downvote. Plain text, one username per
+# line, gitignored — they are policy for THIS box, not platform state, and
+# nothing ever uploads them.
+#
+# The two lists are deliberately independent. "Never downvote" is the common
+# case (an account you don't want a local model penalising unattended);
+# "never upvote" is the arms-length case (your own second account, a partner,
+# anyone where an automated boost would read as vote manipulation). Wanting
+# both means listing the name in both files — collapsing them into one
+# "never vote" list would take away the ability to express either alone.
+NEVER_UPVOTE_FILE = Path(_env_str("SENTINEL_NEVER_UPVOTE_FILE", "never_upvote.txt"))
+NEVER_DOWNVOTE_FILE = Path(_env_str("SENTINEL_NEVER_DOWNVOTE_FILE", "never_downvote.txt"))
 
 # Webhook mode: process events in a background worker so the HTTP response
 # returns immediately. Keeps the public endpoint responsive when Ollama is
@@ -577,6 +592,89 @@ def _is_sandbox_colony(client: ColonyClient, colony_id: str) -> bool:
     return _SANDBOX_CACHE.get(colony_id, False)
 
 
+# ─── Local vote-exemption lists ─────────────────────────────────────────
+# path -> (stat signature, parsed usernames), where the signature is
+# (mtime_ns, size). When it changes the file is re-read. That is what lets
+# an operator add a username while a long-running webhook process is up and
+# have the very next vote honour it — a load-once-at-import cache would mean
+# a restart per edit, which is exactly the mode this feature matters in.
+_VOTE_EXEMPT_CACHE: dict[str, tuple[tuple[int, int] | None, frozenset[str]]] = {}
+
+
+def _parse_username_list(text: str) -> frozenset[str]:
+    """Parse a one-username-per-line exemption list.
+
+    Blank lines and ``#`` comments (whole-line or trailing) are ignored, a
+    leading ``@`` is stripped so a pasted mention works, and names are
+    lowercased: Colony handles are case-insensitive, and a list that only
+    matched the casing the operator happened to type would fail OPEN in
+    precisely the case it exists to prevent.
+    """
+    names = {
+        stripped.lstrip("@").strip().lower()
+        for raw in text.splitlines()
+        if (stripped := raw.split("#", 1)[0].strip())
+    }
+    names.discard("")
+    return frozenset(names)
+
+
+def _load_username_list(path: Path) -> frozenset[str]:
+    """Read + cache an exemption file, re-reading it whenever it changes."""
+    key = str(path)
+    try:
+        st = path.stat()
+        sig: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = None                      # absent is the normal case: no exemptions
+    cached = _VOTE_EXEMPT_CACHE.get(key)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    names: frozenset[str] = frozenset()
+    if sig is not None:
+        try:
+            names = _parse_username_list(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            # Present but unreadable is an operator mistake (wrong perms, a
+            # directory of that name) worth shouting about — but it must not
+            # crash a scan. Cached against the same signature so this logs
+            # once per change, not once per post.
+            logger.warning("Could not read vote-exemption list %s: %s", path, e)
+    _VOTE_EXEMPT_CACHE[key] = (sig, names)
+    return names
+
+
+def vote_is_exempt(username: str | None, value: int) -> bool:
+    """Is a vote of ``value`` on a post by ``username`` locally forbidden?
+
+    ``value`` is the SDK's ±1. An unknown author (``None``) cannot match a
+    list and so is never exempt — the one path that can reach here without a
+    username is a pre-upgrade memory replay, documented in ``_apply_action``.
+    """
+    if not username or value == 0:
+        return False
+    path = NEVER_UPVOTE_FILE if value > 0 else NEVER_DOWNVOTE_FILE
+    return username.strip().lstrip("@").strip().lower() in _load_username_list(path)
+
+
+def log_vote_exemptions() -> None:
+    """Announce both lists at startup, with the path actually consulted.
+
+    Silence here would be indistinguishable from a list sitting in the wrong
+    directory — both look like "no exemptions", and the operator would only
+    find out by watching the sentinel vote on someone it was told not to.
+    Sentinel resolves these relative to the CWD (as it does its config and
+    memory), so the ABSOLUTE path is logged, not just a count.
+    """
+    for label, path in (
+        ("never-upvote", NEVER_UPVOTE_FILE),
+        ("never-downvote", NEVER_DOWNVOTE_FILE),
+    ):
+        names = _load_username_list(path)
+        state = f"{len(names)} entries" if path.exists() else "not present"
+        logger.info("Vote exemptions — %s: %s (%s)", label, state, path.resolve())
+
+
 # The dedicated "ads" colony (/c/ads) is where advertisements are welcome.
 # A post the model flags as an ad must NOT be downvoted merely for being an
 # ad when it lives here — see ``_pending_actions``. Matched by colony NAME
@@ -723,6 +821,10 @@ def analyze_post(post_data: dict, model: str) -> dict | None:
     # without another API round-trip — and so a replayed memory entry keeps
     # the decision.
     result["_colony_name"] = post_data.get("colony_name")
+    # Carry the author's username so the local vote-exemption lists can be
+    # consulted without another API round-trip — and so a judgement replayed
+    # from memory still knows whose post it was.
+    result["_author_username"] = (post_data["post"].get("author") or {}).get("username")
     return result
 
 
@@ -758,8 +860,28 @@ def _pending_actions(judgement: dict) -> list[dict]:
     if value < 0 and is_ad and in_ads_colony:
         value = 0
 
+    # The operator's local lists, applied LAST so they override every vote
+    # decision above — the point of an exemption list is that it is the final
+    # word, not one input among several. Checked here so the vote is never
+    # even queued, and AGAIN in ``_apply_action`` so a vote replayed from an
+    # older memory entry is re-judged against the list as it stands now.
+    author = judgement.get("_author_username")
+    if value != 0 and vote_is_exempt(author, value):
+        logger.info(
+            "Skipping %s of post by %s — on the %s list",
+            "upvote" if value > 0 else "downvote",
+            author,
+            "never-upvote" if value > 0 else "never-downvote",
+        )
+        value = 0
+
     if value != 0:
-        actions.append({"kind": "vote", "value": value})
+        vote_action: dict[str, Any] = {"kind": "vote", "value": value}
+        if author:
+            # Only stamped when known, so the persisted action keeps the
+            # exact shape older sentinels wrote when it isn't.
+            vote_action["author"] = author
+        actions.append(vote_action)
 
     if (judgement.get("category") or "").upper() == "JUNK":
         actions.append({"kind": "junk"})
@@ -816,6 +938,28 @@ def _apply_action(client: ColonyClient, post_id: str, action: dict) -> bool:
     """
     kind = action.get("kind")
     if kind == "vote":
+        # Re-check the local lists at APPLY time. This is the path a vote
+        # saved to ``_pending_actions`` on an earlier run comes back through
+        # — possibly days later, possibly after the operator added this
+        # author to a list — so the decision has to be re-made against the
+        # list as it stands now, not as it stood when the vote was queued.
+        # A vote dict written by a sentinel older than this feature carries
+        # no "author" and cannot be re-checked; it is applied, and the gap
+        # closes as the pending queue drains (5 attempts, then dropped).
+        try:
+            _value = int(action.get("value") or 0)
+        except (TypeError, ValueError):
+            _value = 0
+        if vote_is_exempt(action.get("author"), _value):
+            logger.info(
+                "Not voting on post %s — author %s is on the %s list",
+                post_id[:8], action.get("author"),
+                "never-upvote" if _value > 0 else "never-downvote",
+            )
+            # True, not False: the action is RESOLVED (deliberately not
+            # cast), not deferred. Returning False would re-queue it as a
+            # failure and retry the same forbidden vote for 5 more runs.
+            return True
         try:
             client.vote_post(post_id, int(action["value"]))
             logger.info(
@@ -1070,6 +1214,7 @@ def _process_post(
 def cmd_scan(args: argparse.Namespace) -> None:
     logger.info("Sentinel — scan mode")
     log_model_in_use(args.model)
+    log_vote_exemptions()
     if args.dry_run:
         args.no_vote = True
         args.no_pii = True
@@ -1402,6 +1547,7 @@ def make_webhook_handler(
 def cmd_webhook(args: argparse.Namespace) -> None:
     logger.info("Sentinel — webhook mode")
     log_model_in_use(args.model)
+    log_vote_exemptions()
 
     # Fail fast if the model isn't pulled — otherwise the server would accept
     # webhooks and silently fail every analysis.

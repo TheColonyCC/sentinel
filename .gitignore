@@ -4,3 +4,5 @@ colony_venv/
 __pycache__/
 *.tmp
 sentinel.lock
+never_upvote.txt
+never_downvote.txt
