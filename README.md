@@ -145,6 +145,8 @@ CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`.
 |---------|---------|--------------|-------------|
 | `OLLAMA_HOST` | `http://localhost:11434` | `OLLAMA_HOST` | Ollama API endpoint (same var the `ollama` CLI uses) |
 | `DEFAULT_MODEL` | `qwen3.5:9b-q4_k_m` | `SENTINEL_MODEL` | Ollama model. Must be an installed tag — Ollama lowercases tags on pull, and a startup preflight fails fast (with `ollama pull …`) if it's missing. Also overridable per-run via `--model`. |
+| `REQUIRE_GPU` | `1` (on) | `SENTINEL_REQUIRE_GPU` | Refuse to run if the model is answering from CPU. See **GPU requirement** below. Per-run escape hatch: `--allow-cpu`. |
+| `GPU_MIN_OFFLOAD` | `0.9` | `SENTINEL_GPU_MIN_OFFLOAD` | Fraction of the model that must sit in VRAM before the run is considered healthy. Below it: a warning. At zero: abort. |
 | `DEFAULT_LIMIT` | 20 | — (`--limit`) | Posts per scan run |
 | `MAX_COMMENTS` | 6 | — | Top comments included in analysis |
 | `DEFAULT_DAYS` | 7 | — (`--days`) | Only analyze posts newer than this (scan mode) |
@@ -172,6 +174,47 @@ Environment variables (webhook mode):
 | `WEBHOOK_SECRET` | — | HMAC secret shared with The Colony (16+ chars) |
 | `WEBHOOK_PORT` | `8000` | Port to listen on |
 | `WEBHOOK_PATH` | `/webhook` | URL path for the webhook endpoint |
+
+## GPU requirement
+
+Both modes refuse to start if Ollama would answer from the CPU.
+
+This is not about crashes. Ollama silently falls back to CPU when a model does
+not fit in VRAM, and the run then *works* — at roughly a hundredth of the
+speed. A scan that takes seconds per post takes minutes, most of them ending
+at `OLLAMA_TIMEOUT`, and the whole thing gets through almost nothing while
+reporting success. That is the same shape as the bug where the scanner
+re-read the front page: a run that looks fine and does no work.
+
+**The check asks Ollama, not `nvidia-smi`.** They answer different questions.
+`nvidia-smi` says whether this box has an NVIDIA GPU the driver can see; what
+matters is whether *Ollama put this model on a GPU*. Those come apart in three
+ways that all happen in practice:
+
+* `OLLAMA_HOST` may point at another machine, making the local GPU irrelevant;
+* a present GPU may be full, so the model lands on CPU anyway;
+* Ollama also runs on ROCm and Metal, where `nvidia-smi` is absent on a
+  perfectly good machine.
+
+So the gate reads `size_vram` from Ollama's own `/api/ps`, which reports what
+actually happened on whichever host is serving. `nvidia-smi` is still consulted
+— but only to enrich the error message when the gate trips.
+
+The model has to be resident before `/api/ps` can report anything, so the
+preflight loads it first with an empty-prompt generate. The run was about to
+load it anyway, so the cost is borrowed rather than added.
+
+Three outcomes:
+
+| State | Behaviour |
+|-------|-----------|
+| Fully or mostly in VRAM (>= `GPU_MIN_OFFLOAD`) | Logs `GPU: 'model' is 100% resident in VRAM` and proceeds |
+| Partially offloaded (below the threshold, above zero) | Warns and proceeds — partial offload is legal and sometimes fine |
+| Entirely on CPU (0%) | **Aborts** with the Ollama host, the local GPU inventory, and the fix |
+| Unknown (older Ollama, model dropped, daemon unreachable) | Warns and proceeds — "we cannot tell" is not "it is on CPU" |
+
+To run on CPU deliberately — a box with no GPU where a slow scan is
+acceptable — pass `--allow-cpu`, or set `SENTINEL_REQUIRE_GPU=0`.
 
 ## Vote-exemption lists
 
