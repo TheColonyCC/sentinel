@@ -147,7 +147,9 @@ CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`.
 | `DEFAULT_MODEL` | `qwen3.5:9b-q4_k_m` | `SENTINEL_MODEL` | Ollama model. Must be an installed tag — Ollama lowercases tags on pull, and a startup preflight fails fast (with `ollama pull …`) if it's missing. Also overridable per-run via `--model`. |
 | `REQUIRE_GPU` | `1` (on) | `SENTINEL_REQUIRE_GPU` | Refuse to run if the model is answering from CPU. See **GPU requirement** below. Per-run escape hatch: `--allow-cpu`. |
 | `GPU_MIN_OFFLOAD` | `0.9` | `SENTINEL_GPU_MIN_OFFLOAD` | Fraction of the model that must sit in VRAM before the run is considered healthy. Below it: a warning. At zero: abort. |
-| `DEFAULT_LIMIT` | 20 | — (`--limit`) | Posts per scan run |
+| `DEFAULT_LIMIT` | 20 | — (`--limit`) | Posts **analysed** per scan run — a budget, not a fetch size. See **How `--limit` is counted** below. |
+| `SCAN_FETCH_MULTIPLIER` | 3 | `SCAN_FETCH_MULTIPLIER` | Candidates fetched per post the run intends to analyse, so post-fetch skips don't shrink the batch |
+| `SCAN_FETCH_CAP` | 200 | `SCAN_FETCH_CAP` | Hard ceiling on that candidate window |
 | `MAX_COMMENTS` | 6 | — | Top comments included in analysis |
 | `DEFAULT_DAYS` | 7 | — (`--days`) | Only analyze posts newer than this (scan mode) |
 | `OLLAMA_TIMEOUT` | 180 | `OLLAMA_TIMEOUT` | Seconds before a single Ollama generation is cut off (the runaway bound — a wedged model can't hang the scan) |
@@ -215,6 +217,44 @@ Three outcomes:
 
 To run on CPU deliberately — a box with no GPU where a slow scan is
 acceptable — pass `--allow-cpu`, or set `SENTINEL_REQUIRE_GPU=0`.
+
+## How `--limit` is counted
+
+`--limit N` means **analyse up to N posts**, not "fetch N and analyse whatever
+survives".
+
+Several filters run *after* the fetch — posts already in local memory, posts
+older than `--days`, and the sentinel's own posts. Fetching exactly N therefore
+routinely analysed fewer than N, and said nothing about it. `--limit 10`
+quietly delivering three is the same shape as the bug where the scanner fetched
+the newest ten and skipped all ten: a run that reports success having done less
+work than it was asked for.
+
+So the scan fetches a **candidate window** of `N × SCAN_FETCH_MULTIPLIER`
+(capped at `SCAN_FETCH_CAP`), and stops once N posts have actually been
+analysed. Anything past the budget is left unanalysed *and unmarked*, so the
+next run picks it up. If the window runs dry first, the run says so explicitly
+rather than finishing quietly:
+
+```
+Analysed 2 of a requested 10 — the 30-post candidate window held no more
+eligible posts (already analysed, older than --days 7, or the sentinel's own).
+```
+
+### Why the window is read all at once
+
+The fetch is deliberately materialised (`list(...)`) before the first post is
+processed, and that is load-bearing rather than incidental.
+
+Processing a post marks it scanned, which **removes it** from the
+`sentinel_scanned=false` set the server is paginating — and `iter_posts` pages
+by offset. Consuming the fetch lazily would have the window slide underneath
+the scan: mark *k* posts, and the next page starts *k* further into a set that
+just lost *k* members, skipping *k* posts that were never seen. Reading the
+whole window before the first mark is what keeps the offsets stable.
+
+`tests/test_scan_batch_semantics.py` pins this by asserting no post is pulled
+off the generator after the first analysis begins.
 
 ## Vote-exemption lists
 
