@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import subprocess
 import sys
 import tempfile
 import threading
@@ -92,6 +93,19 @@ OLLAMA_CONNECT_TIMEOUT = _env_int("OLLAMA_CONNECT_TIMEOUT", 5)
 # timing out) is an early "host is degrading" signal worth a log line.
 OLLAMA_SLOW_WARN_SECONDS = _env_int("OLLAMA_SLOW_WARN_SECONDS", 60)
 MEMORY_MAX_AGE_DAYS = 90
+
+# Refuse to run when the model would be answering from CPU. A 27B model on
+# CPU is not "slower" in a way that degrades gracefully — it is minutes per
+# post instead of seconds, which turns a routine scan into an all-night grind
+# that trips OLLAMA_TIMEOUT per post and gets through almost nothing.
+#
+# Set SENTINEL_REQUIRE_GPU=0 to allow CPU (or pass --allow-cpu) on a box that
+# genuinely has no GPU and where a slow scan is acceptable.
+REQUIRE_GPU = _env_str("SENTINEL_REQUIRE_GPU", "1") not in ("0", "false", "no", "")
+# Fraction of the model that must sit in VRAM. Partial offload is legal and
+# sometimes fine, but a model half in system RAM runs at roughly CPU speed —
+# the layers on the CPU dominate. Warn below this, abort only at zero.
+GPU_MIN_OFFLOAD = float(_env_str("SENTINEL_GPU_MIN_OFFLOAD", "0.9"))
 
 # Minimum LLM score (1-10) required to actually cast an upvote. The model
 # tends to recommend "upvote" too readily for merely-OK posts, so we gate
@@ -1174,6 +1188,128 @@ def ensure_model_available(model: str) -> None:
     sys.exit(1)
 
 
+def _local_gpu_hint() -> str:
+    """A short human hint about local GPUs, for the abort message only.
+
+    Deliberately NOT the gate. ``nvidia-smi`` answers "does this box have an
+    NVIDIA GPU the driver can see", which is a different question from "will
+    Ollama use it" — Ollama may be on another host entirely (``OLLAMA_HOST``),
+    may have fallen back to CPU because the model did not fit in VRAM, and
+    does not run on NVIDIA alone (ROCm, Metal). A gate built on nvidia-smi
+    would pass on a box whose Ollama is grinding on CPU, and fail on a working
+    Apple or AMD machine. So it only enriches the error.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return "no nvidia-smi on PATH (non-NVIDIA box, or drivers absent)"
+    if out.returncode != 0:
+        return "nvidia-smi present but failed (driver not loaded?)"
+    gpus = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+    return f"nvidia-smi sees {len(gpus)}: " + "; ".join(gpus) if gpus else (
+        "nvidia-smi reports no GPUs"
+    )
+
+
+def gpu_offload_fraction(model: str) -> float | None:
+    """How much of ``model`` Ollama currently holds in VRAM, 0.0-1.0.
+
+    Returns None when the answer is unknown (daemon unreachable, model not
+    loaded, or a response shape we do not recognise) — the caller decides what
+    to do with "unknown", which must not be the same as "zero".
+
+    ``/api/ps`` is the authority here because it reports what Ollama ACTUALLY
+    did with this model on this host, which is the only thing that matters.
+    """
+    try:
+        resp = requests.get(f"{OLLAMA_HOST}/api/ps", timeout=OLLAMA_CONNECT_TIMEOUT)
+        resp.raise_for_status()
+        loaded = resp.json().get("models", []) or []
+    except Exception as e:
+        logger.debug("Could not read %s/api/ps: %s", OLLAMA_HOST, e)
+        return None
+
+    want = model.lower()
+    for m in loaded:
+        name = (m.get("name") or "").lower()
+        if name != want and name != f"{want}:latest" and name.split(":", 1)[0] != want:
+            continue
+        total = m.get("size") or 0
+        vram = m.get("size_vram")
+        if not total or vram is None:
+            return None
+        return max(0.0, min(1.0, vram / total))
+    return None
+
+
+def ensure_gpu_available(model: str) -> None:
+    """Abort before doing any work if the model would answer from CPU.
+
+    The failure this prevents is not a crash — it is a scan that "works" at
+    roughly a hundredth of the speed. Ollama falls back to CPU silently when a
+    model does not fit in VRAM, and the only existing signal is the
+    per-call OLLAMA_SLOW_WARN_SECONDS warning, which fires AFTER a minute of
+    grinding, once per post, for the whole run.
+
+    The model has to be resident before ``/api/ps`` can report anything, so
+    this loads it first — which the run was about to do anyway, so the cost is
+    borrowed, not added.
+    """
+    if not REQUIRE_GPU:
+        logger.info("GPU check skipped (SENTINEL_REQUIRE_GPU=0)")
+        return
+
+    # Load the model without generating: an empty prompt is Ollama's documented
+    # preload. Without this /api/ps is empty on a cold daemon and every run
+    # would report "unknown".
+    try:
+        requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={"model": model, "prompt": "", "stream": False},
+            timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_TIMEOUT),
+        )
+    except Exception as e:
+        logger.debug("Preload of %s failed: %s", model, e)
+
+    frac = gpu_offload_fraction(model)
+
+    if frac is None:
+        # Unknown is not failure. An older Ollama without size_vram, or a
+        # daemon that dropped the model between calls, must not brick a scan
+        # that would otherwise run fine.
+        logger.warning(
+            "Could not determine GPU offload for %r from %s/api/ps — "
+            "proceeding. Set SENTINEL_REQUIRE_GPU=0 to silence this.",
+            model, OLLAMA_HOST,
+        )
+        return
+
+    if frac <= 0.0:
+        logger.error(
+            "%r is loaded entirely on CPU (0%% in VRAM) — refusing to scan.\n"
+            "  Ollama host : %s\n"
+            "  Local GPUs  : %s\n"
+            "A CPU scan is minutes per post and will mostly hit the %ds "
+            "timeout. Free VRAM, choose a smaller model, or pass --allow-cpu "
+            "(or set SENTINEL_REQUIRE_GPU=0) if you really want this.",
+            model, OLLAMA_HOST, _local_gpu_hint(), OLLAMA_TIMEOUT,
+        )
+        sys.exit(1)
+
+    if frac < GPU_MIN_OFFLOAD:
+        logger.warning(
+            "Only %.0f%% of %r is in VRAM (want >=%.0f%%) — the layers left on "
+            "the CPU will dominate. Scan will continue, but expect it to be "
+            "slow.", frac * 100, model, GPU_MIN_OFFLOAD * 100,
+        )
+        return
+
+    logger.info("GPU: %r is %.0f%% resident in VRAM", model, frac * 100)
+
+
 def _process_post(
     client: ColonyClient,
     post_data: dict,
@@ -1243,6 +1379,12 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
     # Fail fast if the model isn't pulled rather than silently no-op'ing.
     ensure_model_available(args.model)
+    # ...and fail fast if it would answer from CPU, which is the same "the run
+    # did nothing useful" outcome arriving several hours later.
+    if getattr(args, "allow_cpu", False):
+        logger.info("GPU check skipped (--allow-cpu)")
+    else:
+        ensure_gpu_available(args.model)
 
     username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
     client, config = get_or_register_client(username)
@@ -1579,6 +1721,13 @@ def cmd_webhook(args: argparse.Namespace) -> None:
     # Fail fast if the model isn't pulled — otherwise the server would accept
     # webhooks and silently fail every analysis.
     ensure_model_available(args.model)
+    # Same for CPU fallback: a webhook server that answers in ten minutes is
+    # worse than one that refuses to start, because The Colony will time the
+    # delivery out and retry, and the queue backs up behind each event.
+    if getattr(args, "allow_cpu", False):
+        logger.info("GPU check skipped (--allow-cpu)")
+    else:
+        ensure_gpu_available(args.model)
 
     username = (args.username or DEFAULT_USERNAME).lower().replace(" ", "-")
     client, config = get_or_register_client(username)
@@ -1656,6 +1805,11 @@ def build_parser() -> argparse.ArgumentParser:
         "scan", help="One-shot pass over recent posts (cron-friendly)"
     )
     scan.add_argument("--model", default=DEFAULT_MODEL)
+    scan.add_argument(
+        "--allow-cpu", action="store_true",
+        help="Run even if the model is not on the GPU. Expect minutes per "
+             "post rather than seconds.",
+    )
     scan.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     scan.add_argument("--sort", choices=["new", "hot"], default="new")
     scan.add_argument("--days", type=int, default=DEFAULT_DAYS)
@@ -1695,6 +1849,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="HMAC-SHA256 secret (or set WEBHOOK_SECRET env var)",
     )
     wh.add_argument("--model", default=DEFAULT_MODEL)
+    wh.add_argument(
+        "--allow-cpu", action="store_true",
+        help="Serve even if the model is not on the GPU. Deliveries will "
+             "likely time out and be retried.",
+    )
     wh.add_argument("--no-vote", action="store_true", help="Disable voting")
     wh.add_argument("--no-pii", action="store_true", help="Disable PII flagging")
     wh.add_argument(
