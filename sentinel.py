@@ -141,6 +141,19 @@ WEBHOOK_PRUNE_EVERY = 50
 # the next run re-burns the model over all of them. The write is atomic.
 SCAN_SAVE_EVERY = _env_int("SCAN_SAVE_EVERY", 10)
 
+# --limit means "analyse up to N posts", not "fetch N and analyse whatever
+# survives". Several filters run AFTER the fetch — local memory, --days, and
+# the sentinel's own posts — so a straight fetch of N routinely analysed fewer
+# than N and said nothing about it. That is the same shape as the bug where
+# the scanner fetched the newest ten and skipped all ten: a run that reports
+# success having done less work than asked.
+#
+# So over-fetch, then stop at N analyses. The multiplier is a candidate
+# budget, not a promise; SCAN_FETCH_CAP bounds it so a large --limit cannot
+# turn into an enormous request.
+SCAN_FETCH_MULTIPLIER = _env_int("SCAN_FETCH_MULTIPLIER", 3)
+SCAN_FETCH_CAP = _env_int("SCAN_FETCH_CAP", 200)
+
 DEFAULT_USERNAME = "qwen-jorwhol-analyzer"
 DEFAULT_DISPLAY_NAME = "Qwen 3.5 Jorwhol Analyzer"
 DEFAULT_BIO = (
@@ -1416,10 +1429,20 @@ def cmd_scan(args: argparse.Namespace) -> None:
                 new_analyses += 1
         else:
             scanned_filter = scanned_filter_for(args)
+            fetch_n = min(args.limit * SCAN_FETCH_MULTIPLIER, SCAN_FETCH_CAP)
             try:
+                # MATERIALISED ON PURPOSE — do not make this lazy.
+                #
+                # _process_post marks each post scanned as it goes, which
+                # REMOVES it from the sentinel_scanned=false set the server is
+                # paginating. iter_posts pages by offset, so a lazily-consumed
+                # generator would have the window slide underneath it and skip
+                # one unseen post for every post already marked. Collecting the
+                # whole window before the first mark is what makes the offsets
+                # stable. Pinned by tests/test_scan_batch_semantics.py.
                 posts = list(client.iter_posts(
                     sort=args.sort,
-                    max_results=args.limit,
+                    max_results=fetch_n,
                     sentinel_scanned=scanned_filter,
                 ))
             except ColonyAPIError as e:
@@ -1427,6 +1450,10 @@ def cmd_scan(args: argparse.Namespace) -> None:
                 sys.exit(1)
 
             for post in posts:
+                if new_analyses >= args.limit:
+                    # --limit is a budget of ANALYSES. Everything past this is
+                    # left unmarked, so the next run picks it up.
+                    break
                 post_id = post.get("id")
                 title = (post.get("title") or "")[:70]
                 created_at = post.get("created_at")
@@ -1460,6 +1487,17 @@ def cmd_scan(args: argparse.Namespace) -> None:
     finally:
         # Always persist what we finished — even on Ctrl-C / crash / sys.exit.
         _checkpoint()
+
+    # Say so when the run could not fill its budget. Silence here is what let
+    # "analysed 3 of a requested 10" read as a healthy scan.
+    if not args.post_id and new_analyses < args.limit:
+        logger.info(
+            "Analysed %d of a requested %d — the %d-post candidate window held "
+            "no more eligible posts (already analysed, older than --days %d, or "
+            "the sentinel's own). Raise --limit, widen --days, or raise "
+            "SCAN_FETCH_MULTIPLIER if you expected more.",
+            new_analyses, args.limit, fetch_n, args.days,
+        )
 
     if not args.dry_run:
         logger.info("Memory updated: %d posts (added %d new)", len(memory), new_analyses)
