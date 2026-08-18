@@ -1211,6 +1211,28 @@ def _process_post(
     return True
 
 
+def scanned_filter_for(args: argparse.Namespace) -> bool | None:
+    """Value for ``iter_posts(sentinel_scanned=...)`` — the work-queue policy.
+
+    ``False`` (the default) asks the server for the unscanned backlog. Fetching
+    the newest N and dropping the ones we recognise locally looks equivalent
+    and is not: the Sentinel keeps up with the front page, so on a routine pass
+    all N are already scanned and the run does nothing while reporting success.
+    That is the bug this exists to fix — ``--limit 10`` should mean "ten posts
+    to moderate", not "ten posts, probably none of which need moderating".
+
+    ``None`` (no filter) when the operator has explicitly asked to revisit
+    finished work: ``--force``, which also discards local memory, or
+    ``--include-scanned``, which does not.
+
+    Returns ``bool | None`` and never plain ``False``-vs-``None`` by accident —
+    the two are different requests, and ``None`` must not be sent as a filter.
+    """
+    if getattr(args, "force", False) or getattr(args, "include_scanned", False):
+        return None
+    return False
+
+
 def cmd_scan(args: argparse.Namespace) -> None:
     logger.info("Sentinel — scan mode")
     log_model_in_use(args.model)
@@ -1251,8 +1273,13 @@ def cmd_scan(args: argparse.Namespace) -> None:
             if _process_post(client, data, args, memory, results):
                 new_analyses += 1
         else:
+            scanned_filter = scanned_filter_for(args)
             try:
-                posts = list(client.iter_posts(sort=args.sort, max_results=args.limit))
+                posts = list(client.iter_posts(
+                    sort=args.sort,
+                    max_results=args.limit,
+                    sentinel_scanned=scanned_filter,
+                ))
             except ColonyAPIError as e:
                 logger.error("Failed to fetch posts: %s", e)
                 sys.exit(1)
@@ -1634,6 +1661,16 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--days", type=int, default=DEFAULT_DAYS)
     scan.add_argument("--post-id", type=str)
     scan.add_argument("--force", action="store_true")
+    scan.add_argument(
+        "--include-scanned",
+        action="store_true",
+        help=(
+            "Fetch recent posts regardless of whether the Sentinel has "
+            "already scanned them. Default is to pull only the unscanned "
+            "backlog (?sentinel_scanned=false), which is what makes --limit "
+            "count posts that actually need moderating."
+        ),
+    )
     scan.add_argument("--no-vote", action="store_true", help="Disable voting")
     scan.add_argument("--no-pii", action="store_true", help="Disable PII flagging")
     scan.add_argument("--confirm", action="store_true", help="Ask before voting")
