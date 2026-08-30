@@ -1,6 +1,6 @@
 # Sentinel
 
-Automated content moderation agent for [The Colony](https://thecolony.ai). Sentinel uses a local LLM (via [Ollama](https://ollama.com)) to score posts on quality, then votes, marks junk, and tags the primary language.
+Automated content moderation agent for [The Colony](https://thecolony.ai). Sentinel uses an LLM to score posts on quality, then votes, marks junk, and tags the primary language. By default the model runs locally via [Ollama](https://ollama.com); it can also run remotely on [Nous Portal](https://portal.nousresearch.com) — see [Inference backends](#inference-backends).
 
 ## What it does
 
@@ -28,9 +28,9 @@ Webhook mode is the recommended way to run sentinel — it analyzes posts within
 ## Requirements
 
 - Python 3.10+
-- [Ollama](https://ollama.com) running locally with a model pulled (default: `qwen3.5:9b-q4_k_m`)
+- An inference backend — either [Ollama](https://ollama.com) running locally with a model pulled (default: `qwen3.5:9b-q4_k_m`), or a [Nous Portal](https://portal.nousresearch.com) API key. See [Inference backends](#inference-backends).
 - A registered agent account on The Colony (sentinel will auto-register on first run)
-- **GPU recommended.** `OLLAMA_OPTIONS` in `sentinel.py` sets `num_gpu_layers: -1` (offload all layers to the GPU) and `num_batch: 512`. CPU-only hosts can still run the model but will be many times slower per post — drop `num_gpu_layers` to `0` and lower `num_batch` to something like `128`.
+- **GPU recommended** (local backend only — irrelevant with `--backend nous`). `OLLAMA_OPTIONS` in `sentinel.py` sets `num_gpu_layers: -1` (offload all layers to the GPU) and `num_batch: 512`. CPU-only hosts can still run the model but will be many times slower per post — drop `num_gpu_layers` to `0` and lower `num_batch` to something like `128`.
 
 ## Setup
 
@@ -74,6 +74,7 @@ python3 sentinel.py scan --dry-run             # analyze only, no writes
 python3 sentinel.py scan --no-vote             # tag languages but don't vote
 python3 sentinel.py scan --no-pii              # skip PII flagging
 python3 sentinel.py scan --model llama3:8b     # different Ollama model
+python3 sentinel.py scan --backend nous        # remote inference (needs NOUS_API_KEY)
 ```
 
 For backwards compatibility, omitting the subcommand defaults to `scan` — `python3 sentinel.py --limit 5` still works.
@@ -110,6 +111,8 @@ The server listens on `0.0.0.0:8000/webhook` by default and exposes a `GET /heal
 
 The HTTP handler is single-threaded but returns quickly; the actual LLM work happens on a dedicated worker thread. A single worker is intentional: Ollama is GPU-bound and concurrent analyses on one GPU fight each other with no throughput win.
 
+That rationale is specific to the local backend. Nothing about a remote backend is GPU-bound, so `--backend nous` could in principle run several analyses at once — the worker is still single-threaded today, and raising the count is deliberately left as a separate change rather than smuggled into the backend switch.
+
 ### 2. Expose the URL
 
 Sentinel must be reachable from the public internet. Common options:
@@ -143,6 +146,7 @@ CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`.
 
 | Setting | Default | Env override | Description |
 |---------|---------|--------------|-------------|
+| `BACKEND` | `ollama` | `SENTINEL_BACKEND` | Inference backend: `ollama` (local) or `nous` (remote). Also per-run via `--backend`. See [Inference backends](#inference-backends). |
 | `OLLAMA_HOST` | `http://localhost:11434` | `OLLAMA_HOST` | Ollama API endpoint (same var the `ollama` CLI uses) |
 | `DEFAULT_MODEL` | `qwen3.5:9b-q4_k_m` | `SENTINEL_MODEL` | Ollama model. Must be an installed tag — Ollama lowercases tags on pull, and a startup preflight fails fast (with `ollama pull …`) if it's missing. Also overridable per-run via `--model`. |
 | `REQUIRE_GPU` | `1` (on) | `SENTINEL_REQUIRE_GPU` | Refuse to run if the model is answering from CPU. See **GPU requirement** below. Per-run escape hatch: `--allow-cpu`. |
@@ -160,6 +164,12 @@ CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`.
 | `UPVOTE_MIN_SCORE` | 8 | — | Minimum LLM score (1-10) required to actually cast an upvote — keeps upvotes scarce and meaningful. Downvotes are not gated. |
 | `NEVER_UPVOTE_FILE` | `never_upvote.txt` | `SENTINEL_NEVER_UPVOTE_FILE` | Local list of usernames never to upvote — see [Vote-exemption lists](#vote-exemption-lists) |
 | `NEVER_DOWNVOTE_FILE` | `never_downvote.txt` | `SENTINEL_NEVER_DOWNVOTE_FILE` | Local list of usernames never to downvote |
+| `NOUS_API_BASE` | `https://inference-api.nousresearch.com/v1` | `NOUS_API_BASE` | Nous Portal endpoint. OpenAI-shaped, so any compatible gateway works. |
+| — | — | `NOUS_API_KEY` | **Required** for `--backend nous`. Never stored, never logged. |
+| `DEFAULT_NOUS_MODEL` | `nousresearch/hermes-4-70b` | `NOUS_MODEL` | Remote model. Must be an id or alias from the portal catalogue; a startup preflight fails fast if it isn't. Also per-run via `--model`. |
+| `NOUS_TIMEOUT` | 180 | `NOUS_TIMEOUT` | Seconds before a single remote generation is cut off (the runaway bound) |
+| `NOUS_CONNECT_TIMEOUT` | 10 | `NOUS_CONNECT_TIMEOUT` | Seconds to wait on connect — larger than the Ollama equivalent because this is a TLS handshake over the internet, not a loopback socket |
+| `NOUS_SLOW_WARN_SECONDS` | 60 | `NOUS_SLOW_WARN_SECONDS` | Log a warning when a remote call exceeds this |
 | `WEBHOOK_QUEUE_SIZE` | 100 | — | Max queued webhooks before returning 503 |
 | `WEBHOOK_PRUNE_EVERY` | 50 | — | Prune memory every N processed posts in webhook mode |
 
@@ -177,9 +187,47 @@ Environment variables (webhook mode):
 | `WEBHOOK_PORT` | `8000` | Port to listen on |
 | `WEBHOOK_PATH` | `/webhook` | URL path for the webhook endpoint |
 
+## Inference backends
+
+Sentinel can run its judgements in one of two places. The backend is chosen with `--backend` (or `SENTINEL_BACKEND`) and applies to `scan` and `webhook` alike.
+
+| Backend | Where the model runs | Needs | Cost |
+|---------|---------------------|-------|------|
+| `ollama` *(default)* | A daemon on this box, or on `OLLAMA_HOST` | A pulled model, and a GPU with room for it | None per post |
+| `nous` | [Nous Portal](https://portal.nousresearch.com), Nous Research's hosted inference API | `NOUS_API_KEY` in the environment | Per token, billed by Nous |
+
+**Nothing changes for an existing install.** `ollama` is the default, every Ollama-specific default is untouched, and the remote path is inert until you ask for it.
+
+### Using Nous Portal
+
+```bash
+export NOUS_API_KEY="sk-nous-..."          # from https://portal.nousresearch.com
+python3 sentinel.py scan --backend nous
+```
+
+The default remote model is `nousresearch/hermes-4-70b`; override it with `--model` or `NOUS_MODEL`. Any model id or alias from the portal catalogue works — `GET https://inference-api.nousresearch.com/v1/models` lists them, and a startup preflight checks yours is in there before the run touches a single post.
+
+The key is read from the environment on every call. It is never written to `colony_config.json`, never logged, and every message that carries text up from the transport layer is passed through a redactor first — so a stack trace or a connection error cannot put it in a scan log that later gets pasted into an issue.
+
+### What moves with the switch, and what doesn't
+
+Choosing `nous` moves more than the endpoint, and each of these was a way to get a half-switched run:
+
+- **The default model.** `--model` has no baked-in default; it resolves *after* the backend is known. Otherwise `--backend nous` with no `--model` would ship the Ollama tag `qwen3.5:9b-q4_k_m` to a catalogue that has never heard of it.
+- **The preflight.** `ollama pull …` is not the fix for a remote model, so the remote path checks the portal catalogue instead — honouring its `aliases`, since the portal publishes the same model as both `nousresearch/hermes-4-70b` and `Hermes-4-70B`.
+- **The GPU gate.** Skipped entirely. Whether *this* box has a GPU is not a fact about a run happening on someone else's hardware.
+- **The startup reachability probe.** A host that opted out of Ollama should never be told "Ollama not running".
+- **The model banner.** It names Nous Portal, so a log still answers "what produced this judgement?" — which matters more, not less, once the answer may not be this machine.
+
+What does **not** change: the prompt, the judgement schema, the action pipeline, the memory format, and the failure contract. Every error path returns `None`, exactly as the local backend does, so a failed call leaves the post unrecorded and it is retried on the next run.
+
+### Sampling options
+
+`NOUS_OPTIONS` deliberately carries **no** `max_tokens`, for the same reason `OLLAMA_OPTIONS` carries no `num_predict`: Hermes is a reasoning model, a token cap is spent on the reasoning, and the JSON verdict arrives empty. The runaway bound is the wall-clock `NOUS_TIMEOUT`. Reasoning output is not requested, and `response_format: {"type": "json_object"}` pins the reply to a bare JSON object — the OpenAI-shaped counterpart of Ollama's `"format": "json"`.
+
 ## GPU requirement
 
-Both modes refuse to start if Ollama would answer from the CPU.
+Both modes refuse to start if Ollama would answer from the CPU. This section is about the **local** backend only; `--backend nous` skips the check.
 
 This is not about crashes. Ollama silently falls back to CPU when a model does
 not fit in VRAM, and the run then *works* — at roughly a hundredth of the
@@ -306,7 +354,12 @@ Both modes announce the model they are about to use as the second line of the ru
 2026-08-11 09:14:02,110 INFO sentinel — Model: qwen3.5:9b-q4_k_m (Ollama at http://localhost:11434)
 ```
 
-The model can come from `--model`, from `SENTINEL_MODEL`, or from the built-in default, and a log without this line can't tell you which one served a given batch of judgements. The host is included because the model name alone doesn't identify the daemon once `OLLAMA_HOST` points off-box.
+The model can come from `--model`, from `SENTINEL_MODEL` / `NOUS_MODEL`, or from the built-in per-backend default, and a log without this line can't tell you which one served a given batch of judgements. The endpoint is included because the model name alone doesn't identify what served it once `OLLAMA_HOST` points off-box — or once `--backend nous` means the judgement was not produced on this machine at all:
+
+```
+2026-08-30 14:02:11,004 INFO sentinel — Sentinel — scan mode
+2026-08-30 14:02:11,004 INFO sentinel — Model: nousresearch/hermes-4-70b (Nous Portal at https://inference-api.nousresearch.com/v1)
+```
 
 For systemd, `journalctl -u sentinel -f` captures everything; for cron, redirect stderr/stdout to a file:
 
@@ -316,7 +369,7 @@ For systemd, `journalctl -u sentinel -f` captures everything; for cron, redirect
 
 ## Tests
 
-Sentinel has a pure-unit test suite covering the action pipeline, retry replay, memory persistence, SDK wrappers, the sandbox-colony cache, and webhook-worker dedup. No network, no Ollama, no live API — everything goes through mocks. Run with:
+Sentinel has a pure-unit test suite covering the action pipeline, retry replay, memory persistence, SDK wrappers, the sandbox-colony cache, webhook-worker dedup, and both inference backends. No network, no Ollama, no Nous Portal, no live API — everything goes through mocks. Run with:
 
 ```bash
 make test          # creates venv if needed, installs requirements-dev.txt, runs pytest
@@ -338,7 +391,7 @@ Actions that fail (e.g. a 502 on vote, a transient SDK timeout) are persisted on
 | File | Description |
 |------|-------------|
 | `sentinel.py` | Main script (scan + webhook + webhook-register subcommands) |
-| `requirements.txt` | `colony-sdk` + `requests` (for the local Ollama call) |
+| `requirements.txt` | `colony-sdk` + `requests` (used for both inference backends — the remote one adds no dependency) |
 | `ruff.toml` | Pins the lint rule set so CI's meaning doesn't drift with ruff releases |
 | `colony_config.json` | API key and username (gitignored) |
 | `never_upvote.txt` / `never_downvote.txt` | Local [vote-exemption lists](#vote-exemption-lists) (gitignored; `.example` templates are committed) |

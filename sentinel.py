@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Sentinel — automated content moderation agent for The Colony.
 
-Uses a local LLM (via Ollama) to score posts on quality, then:
+Uses an LLM to score posts on quality — a local one via Ollama by default, or
+Nous Portal's hosted inference API when ``--backend nous`` is selected — then:
   - Casts votes (upvote good, downvote spam), subject to the local
     ``never_upvote.txt`` / ``never_downvote.txt`` exemption lists
   - Marks JUNK posts (sentinel/admin role required)
@@ -13,6 +14,11 @@ Two modes:
 
 All Colony API calls go through ``colony-sdk``, which handles auth, token
 refresh, typed errors, and configurable retries on 429/502/503/504.
+
+The inference backend is selected with ``--backend {ollama,nous}`` or the
+``SENTINEL_BACKEND`` environment variable. ``ollama`` is the default and
+nothing about it changed; ``nous`` swaps the single ``call_ollama`` hop for a
+call to Nous Portal and needs ``NOUS_API_KEY`` in the environment.
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-import requests  # only used for the local Ollama call
+import requests  # only used to reach the inference backend (Ollama / Nous Portal)
 
 from colony_sdk import (
     ColonyAPIError,
@@ -66,10 +72,47 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
+    """Environment override constrained to a fixed set of values.
+
+    Same contract as :func:`_env_int`: an unrecognised value warns to stderr
+    and falls back rather than raising, because these are read at import,
+    before logging is configured — and because a typo in an environment
+    variable must not make ``import sentinel`` fail for the test suite.
+    Comparison is case-insensitive and whitespace-tolerant.
+    """
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw not in choices:
+        print(
+            f"[sentinel] ignoring invalid {name}={raw!r} (expected one of "
+            f"{', '.join(choices)}); using {default}", file=sys.stderr,
+        )
+        return default
+    return raw
+
+
 # ─── Config ─────────────────────────────────────────────────────────────
 # Most settings below can be overridden via environment variables (handy on
 # a host where you don't want to edit code to switch models or tune timeouts).
 LOCK_FILE = Path("sentinel.lock")
+
+# Which engine runs the judgements. "ollama" is the default and the only one
+# that existed before: a daemon on this box (or on OLLAMA_HOST), no API key,
+# no per-post cost. "nous" sends the same prompt to Nous Portal's hosted
+# inference API instead, for hosts with no GPU to spare — a small VPS running
+# webhook mode, or a laptop that should not be pinned at 100% for a scan.
+#
+# Selected with --backend or SENTINEL_BACKEND. The choice is process-wide
+# rather than per-call: it decides which endpoint, which credentials, which
+# preflight and which timeouts apply, and a run that silently mixed the two
+# would make "which model produced this judgement?" unanswerable from a log.
+BACKEND_OLLAMA = "ollama"
+BACKEND_NOUS = "nous"
+BACKENDS = (BACKEND_OLLAMA, BACKEND_NOUS)
+BACKEND = _env_choice("SENTINEL_BACKEND", BACKEND_OLLAMA, BACKENDS)
+
 # OLLAMA_HOST is the same env var the `ollama` CLI honours.
 OLLAMA_HOST = _env_str("OLLAMA_HOST", "http://localhost:11434")
 # SENTINEL_MODEL sets the default model (still overridable per-run via --model).
@@ -92,6 +135,43 @@ OLLAMA_CONNECT_TIMEOUT = _env_int("OLLAMA_CONNECT_TIMEOUT", 5)
 # Healthy generations are far quicker than this; crossing it (without yet
 # timing out) is an early "host is degrading" signal worth a log line.
 OLLAMA_SLOW_WARN_SECONDS = _env_int("OLLAMA_SLOW_WARN_SECONDS", 60)
+
+# ── Remote backend: Nous Portal ──────────────────────────────────────────
+# Nous Portal serves an OpenAI-shaped API, so the call is a plain
+# POST {NOUS_API_BASE}/chat/completions with a bearer token. Base URL is
+# configurable because the same code path works against any OpenAI-compatible
+# gateway, but everything here is defaulted and documented for Nous Portal.
+NOUS_API_BASE = _env_str(
+    "NOUS_API_BASE", "https://inference-api.nousresearch.com/v1").rstrip("/")
+# The key is read from the environment on every call and never stored, never
+# logged, and never written to colony_config.json. Keys are issued at
+# https://portal.nousresearch.com.
+NOUS_API_KEY_ENV = "NOUS_API_KEY"
+# NOUS_MODEL is the remote counterpart of SENTINEL_MODEL. It must be a model
+# id (or alias) from the portal catalogue — GET {NOUS_API_BASE}/models — not
+# an Ollama tag; see default_model_for() for why the two defaults are separate.
+DEFAULT_NOUS_MODEL = _env_str("NOUS_MODEL", "nousresearch/hermes-4-70b")
+# Same wall-clock runaway bound as the local backend. The read budget matches
+# OLLAMA_TIMEOUT because the thing being bounded is the same (one generation),
+# but the connect budget is larger: this is a TLS handshake to a host on the
+# internet, not a loopback socket, so 5s is tight enough to fail on an
+# ordinary slow network and call it an outage.
+NOUS_TIMEOUT = _env_int("NOUS_TIMEOUT", 180)
+NOUS_CONNECT_TIMEOUT = _env_int("NOUS_CONNECT_TIMEOUT", 10)
+NOUS_SLOW_WARN_SECONDS = _env_int("NOUS_SLOW_WARN_SECONDS", 60)
+# Sampling options sent alongside the request. Deliberately NO max_tokens, for
+# exactly the reason OLLAMA_OPTIONS carries no num_predict: Hermes is a
+# reasoning model, a token cap is spent on the reasoning, and the JSON verdict
+# arrives empty. The runaway bound is NOUS_TIMEOUT.
+#
+# `reasoning` is deliberately not requested either. The portal catalogue
+# reports `reasoning.mandatory = false` for the Hermes models, and
+# response_format below pins the reply to a bare JSON object — which is what
+# the rest of the pipeline parses.
+NOUS_OPTIONS = {
+    "temperature": 0.3,
+}
+
 MEMORY_MAX_AGE_DAYS = 90
 
 # Refuse to run when the model would be answering from CPU. A 27B model on
@@ -783,6 +863,190 @@ def call_ollama(model: str, messages: list[dict]) -> dict | None:
     return parsed
 
 
+# ─── Nous Portal call (remote backend) ──────────────────────────────────
+def _apply_backend(name: str | None) -> str:
+    """Select the inference backend for this process. Returns the active one.
+
+    ``None`` means "leave it as the environment set it", so callers can pass
+    an unset flag straight through. An unrecognised explicit value exits(2) —
+    argparse's own code for a bad argument — rather than falling back, because
+    silently running the wrong backend is the failure this whole flag exists
+    to make visible. (Bad values in SENTINEL_BACKEND are handled one level
+    earlier by :func:`_env_choice`, which warns and falls back so that merely
+    importing the module cannot fail.)
+    """
+    global BACKEND
+    if name is None:
+        return BACKEND
+    cleaned = name.strip().lower()
+    if cleaned not in BACKENDS:
+        print(
+            f"[sentinel] unknown backend {name!r} (expected one of "
+            f"{', '.join(BACKENDS)})", file=sys.stderr,
+        )
+        raise SystemExit(2)
+    BACKEND = cleaned
+    return BACKEND
+
+
+def default_model_for(backend: str) -> str:
+    """The default model for ``backend``.
+
+    ``--model`` deliberately defaults to ``None`` rather than to
+    ``DEFAULT_MODEL``: an argparse default is fixed before the backend is
+    known, so ``--backend nous`` with no ``--model`` would otherwise ship an
+    Ollama tag (``qwen3.5:9b-q4_k_m``) to a catalogue that has never heard of
+    it — a preflight abort at best, and at worst a confusing one that blames
+    the model name the operator never typed. Resolving the default *after*
+    the backend is chosen is what makes the two flags safe in either order.
+    """
+    return DEFAULT_NOUS_MODEL if backend == BACKEND_NOUS else DEFAULT_MODEL
+
+
+def _nous_api_key() -> str:
+    """The Nous Portal key, read fresh from the environment each time."""
+    return (os.environ.get(NOUS_API_KEY_ENV) or "").strip()
+
+
+def _redact(text: str) -> str:
+    """Scrub the configured API key out of anything bound for a log.
+
+    Nothing below is *expected* to echo the key back — ``requests`` keeps
+    headers out of its exception strings — but "expected" is not a control.
+    A key that reaches a log file has left the process, and a scan log is
+    exactly the artefact somebody pastes into a bug report. One choke point
+    on every message that carries text from the transport layer costs
+    nothing and does not depend on a third party's __str__ staying polite.
+    """
+    key = _nous_api_key()
+    return text.replace(key, "<redacted>") if key and key in text else text
+
+
+def _parse_json_answer(content: str) -> dict:
+    """Parse the model's JSON verdict, tolerating a reasoning preamble.
+
+    ``response_format: json_object`` should give a bare object, and the plain
+    parse is the expected path. The fallback exists because the alternative
+    failure is invisible: if a preamble ever does leak through, every post in
+    the run fails to parse, each one logs a generic error, and the run
+    reports success having moderated nothing. Recovering the outermost
+    ``{...}`` span turns that into one warning and a usable verdict.
+
+    Raises ``ValueError`` when there is no JSON object at all, so the caller
+    treats it like any other failure — return None, retry the post next run.
+    """
+    text = (content or "").strip()
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        obj = None
+    if isinstance(obj, dict):
+        return obj
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError(f"no JSON object in model response ({len(text)} chars)")
+    recovered = json.loads(text[start:end + 1])
+    if not isinstance(recovered, dict):
+        raise ValueError("model response was not a JSON object")
+    logger.warning(
+        "Nous response carried %d characters before the JSON verdict — parsed "
+        "the outermost object instead", start,
+    )
+    return recovered
+
+
+def call_nous(model: str, messages: list[dict]) -> dict | None:
+    """One generation on Nous Portal. Returns None on any failure.
+
+    Mirrors :func:`call_ollama`'s contract exactly — every error path returns
+    None so the post is left unrecorded and retried next run, and no failure
+    here can raise out and kill the scan loop.
+    """
+    key = _nous_api_key()
+    if not key:
+        logger.error(
+            "%s is not set — the nous backend needs a Nous Portal API key",
+            NOUS_API_KEY_ENV,
+        )
+        return None
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        # The OpenAI-shaped counterpart of Ollama's `"format": "json"`.
+        "response_format": {"type": "json_object"},
+        **NOUS_OPTIONS,
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    started = time.monotonic()
+    try:
+        resp = requests.post(
+            f"{NOUS_API_BASE}/chat/completions", json=payload, headers=headers,
+            # (connect, read): an unreachable endpoint fails on the connect
+            # budget; a wedged generation is cut off at NOUS_TIMEOUT.
+            timeout=(NOUS_CONNECT_TIMEOUT, NOUS_TIMEOUT),
+        )
+        # These four are separated out because the operator action differs for
+        # each, and "Nous Portal error: 402" in a log does not say "top up".
+        if resp.status_code in (401, 403):
+            logger.error(
+                "Nous Portal rejected the credentials (HTTP %d) — check %s",
+                resp.status_code, NOUS_API_KEY_ENV,
+            )
+            return None
+        if resp.status_code == 402:
+            logger.error(
+                "Nous Portal is out of credit (HTTP 402) — top up at "
+                "https://portal.nousresearch.com"
+            )
+            return None
+        if resp.status_code == 429:
+            logger.warning(
+                "Nous Portal rate-limited this call (HTTP 429); post will "
+                "retry next run"
+            )
+            return None
+        if resp.status_code >= 500:
+            logger.error(
+                "Nous Portal server error (HTTP %d); post will retry next run",
+                resp.status_code,
+            )
+            return None
+        resp.raise_for_status()
+        parsed = _parse_json_answer(
+            resp.json()["choices"][0]["message"]["content"])
+    except requests.exceptions.Timeout:
+        logger.warning(
+            "Nous Portal timed out after %ds — post will retry next run",
+            NOUS_TIMEOUT,
+        )
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error(
+            "Nous Portal unreachable at %s (%s)", NOUS_API_BASE, _redact(str(e)))
+        return None
+    except Exception as e:
+        logger.error("Nous Portal error: %s", _redact(str(e)))
+        return None
+    elapsed = time.monotonic() - started
+    if elapsed > NOUS_SLOW_WARN_SECONDS:
+        logger.warning(
+            "Nous Portal call took %.0fs (healthy calls are well under %ds) — "
+            "the endpoint may be under load", elapsed, NOUS_SLOW_WARN_SECONDS,
+        )
+    return parsed
+
+
+def call_model(model: str, messages: list[dict]) -> dict | None:
+    """Run one generation on the active backend. None on any failure."""
+    if BACKEND == BACKEND_NOUS:
+        return call_nous(model, messages)
+    return call_ollama(model, messages)
+
+
 # ─── Post fetch + analysis ──────────────────────────────────────────────
 def fetch_post_with_comments(client: ColonyClient, post_id: str) -> dict | None:
     """Fetch a post + the first ``MAX_COMMENTS`` top-level comments."""
@@ -831,7 +1095,7 @@ def analyze_post(post_data: dict, model: str) -> dict | None:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"Analyze this post and its replies:\n\n{content}"},
     ]
-    result = call_ollama(model, messages)
+    result = call_model(model, messages)
     if result is None:
         return None
     result["post_id"] = post_data["post"].get("id")
@@ -1160,20 +1424,83 @@ def log_model_in_use(model: str) -> None:
     scan's judgements look wrong — and it is not recoverable after the fact,
     because the model can come from ``--model``, from ``SENTINEL_MODEL``, or
     from the built-in default, and the three leave no trace apart from this
-    line. The Ollama host goes with it: the model name alone doesn't say which
-    daemon served it, which matters as soon as ``OLLAMA_HOST`` points off-box.
+    line. The endpoint goes with it: the model name alone doesn't say what
+    served it, which matters as soon as ``OLLAMA_HOST`` points off-box — and
+    matters more once ``--backend nous`` means the judgement may not have been
+    produced on this machine at all.
     """
-    logger.info("Model: %s (Ollama at %s)", model, OLLAMA_HOST)
+    if BACKEND == BACKEND_NOUS:
+        logger.info("Model: %s (Nous Portal at %s)", model, NOUS_API_BASE)
+    else:
+        logger.info("Model: %s (Ollama at %s)", model, OLLAMA_HOST)
 
 
 def ensure_model_available(model: str) -> None:
-    """Abort early if the requested model isn't pulled into Ollama.
+    """Abort early if ``model`` isn't usable on the active backend.
 
-    The startup preflight only confirms the daemon is reachable. If the
-    model itself is missing, every ``call_ollama`` would just return None
-    and the whole run would silently do nothing but log per-post errors —
-    so fail loudly here with the exact fix instead.
+    The startup preflight only confirms the endpoint is reachable. If the
+    model itself is missing, every generation would just return None and the
+    whole run would silently do nothing but log per-post errors — so fail
+    loudly here, with the fix that applies to the backend in use.
     """
+    if BACKEND == BACKEND_NOUS:
+        _ensure_nous_model(model)
+    else:
+        _ensure_ollama_model(model)
+
+
+def _ensure_nous_model(model: str) -> None:
+    """Abort unless ``model`` is in the Nous Portal catalogue and a key is set.
+
+    The catalogue (``GET {NOUS_API_BASE}/models``) is served without
+    authentication, which is why the key check comes first: otherwise a host
+    with no ``NOUS_API_KEY`` would sail through the model check and only
+    discover the real problem one error per post later.
+
+    Matching honours the catalogue's own ``aliases`` list and is
+    case-insensitive, because the portal publishes the same model as both
+    ``nousresearch/hermes-4-70b`` and ``Hermes-4-70B``; a preflight that
+    accepted only the canonical id would reject a name the catalogue itself
+    hands out.
+    """
+    if not _nous_api_key():
+        logger.error(
+            "%s is not set. Create a key at https://portal.nousresearch.com "
+            "and export it:  export %s=...", NOUS_API_KEY_ENV, NOUS_API_KEY_ENV,
+        )
+        sys.exit(1)
+    try:
+        resp = requests.get(
+            f"{NOUS_API_BASE}/models", timeout=NOUS_CONNECT_TIMEOUT)
+        resp.raise_for_status()
+        rows = resp.json().get("data", []) or []
+    except Exception as e:
+        logger.error(
+            "Could not query the Nous Portal catalogue at %s: %s",
+            NOUS_API_BASE, _redact(str(e)),
+        )
+        sys.exit(1)
+    known: set[str] = set()
+    for row in rows:
+        if row.get("id"):
+            known.add(str(row["id"]).lower())
+        for alias in row.get("aliases") or []:
+            known.add(str(alias).lower())
+    if model.lower() in known:
+        return
+    # Listing 300+ third-party models would bury the answer, so name the
+    # Nous-published ones and point at the catalogue for the rest.
+    own = sorted(n for n in known if n.startswith("nousresearch/"))
+    logger.error(
+        "Nous Portal model %r is not in the catalogue (%d models listed). "
+        "Nous-published models: %s. Full catalogue: %s/models",
+        model, len(rows), ", ".join(own) or "(none)", NOUS_API_BASE,
+    )
+    sys.exit(1)
+
+
+def _ensure_ollama_model(model: str) -> None:
+    """Abort early if the requested model isn't pulled into Ollama."""
     try:
         resp = requests.get(
             f"{OLLAMA_HOST}/api/tags", timeout=OLLAMA_CONNECT_TIMEOUT)
@@ -1271,6 +1598,13 @@ def ensure_gpu_available(model: str) -> None:
     this loads it first — which the run was about to do anyway, so the cost is
     borrowed, not added.
     """
+    if BACKEND == BACKEND_NOUS:
+        # Nothing local to check: the generation happens on Nous Portal's
+        # hardware. Whether THIS box has a GPU is not a fact about the run,
+        # and /api/ps would answer about a daemon nothing is going to call.
+        logger.info("GPU check skipped (backend=%s)", BACKEND)
+        return
+
     if not REQUIRE_GPU:
         logger.info("GPU check skipped (SENTINEL_REQUIRE_GPU=0)")
         return
@@ -1384,6 +1718,7 @@ def scanned_filter_for(args: argparse.Namespace) -> bool | None:
 
 def cmd_scan(args: argparse.Namespace) -> None:
     logger.info("Sentinel — scan mode")
+    args.model = getattr(args, "model", None) or default_model_for(BACKEND)
     log_model_in_use(args.model)
     log_vote_exemptions()
     if args.dry_run:
@@ -1753,6 +2088,7 @@ def make_webhook_handler(
 
 def cmd_webhook(args: argparse.Namespace) -> None:
     logger.info("Sentinel — webhook mode")
+    args.model = getattr(args, "model", None) or default_model_for(BACKEND)
     log_model_in_use(args.model)
     log_vote_exemptions()
 
@@ -1833,6 +2169,21 @@ def cmd_webhook_register(args: argparse.Namespace) -> None:
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────
+BACKEND_HELP = (
+    "Inference backend. 'ollama' runs the model locally (default); 'nous' "
+    "sends the same prompt to Nous Portal and needs NOUS_API_KEY set. "
+    "Env: SENTINEL_BACKEND."
+)
+
+
+def _model_help() -> str:
+    return (
+        f"Model to judge with. Defaults per backend: {DEFAULT_MODEL} for "
+        f"ollama (env SENTINEL_MODEL), {DEFAULT_NOUS_MODEL} for nous "
+        f"(env NOUS_MODEL)."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Sentinel — moderation agent for The Colony"
@@ -1842,7 +2193,9 @@ def build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser(
         "scan", help="One-shot pass over recent posts (cron-friendly)"
     )
-    scan.add_argument("--model", default=DEFAULT_MODEL)
+    scan.add_argument(
+        "--backend", choices=list(BACKENDS), default=None, help=BACKEND_HELP)
+    scan.add_argument("--model", default=None, help=_model_help())
     scan.add_argument(
         "--allow-cpu", action="store_true",
         help="Run even if the model is not on the GPU. Expect minutes per "
@@ -1886,7 +2239,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="HMAC-SHA256 secret (or set WEBHOOK_SECRET env var)",
     )
-    wh.add_argument("--model", default=DEFAULT_MODEL)
+    wh.add_argument(
+        "--backend", choices=list(BACKENDS), default=None, help=BACKEND_HELP)
+    wh.add_argument("--model", default=None, help=_model_help())
     wh.add_argument(
         "--allow-cpu", action="store_true",
         help="Serve even if the model is not on the GPU. Deliveries will "
@@ -1931,6 +2286,9 @@ def main() -> None:
     configure_logging()
     parser = build_parser()
     args = parser.parse_args(_normalize_argv(sys.argv[1:]))
+    # Before any dispatch: cmd_scan / cmd_webhook resolve the default model
+    # from the active backend, and the preflights branch on it.
+    _apply_backend(getattr(args, "backend", None))
 
     if args.command == "scan":
         cmd_scan(args)
@@ -1943,10 +2301,26 @@ def main() -> None:
         sys.exit(1)
 
 
-def _ollama_required(argv: list[str]) -> bool:
-    """webhook-register doesn't need Ollama; everything else does."""
+def _inference_required(argv: list[str]) -> bool:
+    """webhook-register needs no inference backend; everything else does."""
     cmd = _normalize_argv(argv)[0]
     return cmd not in ("webhook-register", "-h", "--help")
+
+
+def _argv_backend(argv: list[str]) -> str | None:
+    """Read ``--backend`` out of raw argv, before argparse has run.
+
+    The reachability probe below happens before ``main()`` parses anything,
+    and probing the wrong endpoint would report "Ollama not running" on a
+    host that never intended to use Ollama — an error naming a component the
+    operator deliberately opted out of is worse than no error at all.
+    """
+    for i, tok in enumerate(argv):
+        if tok == "--backend" and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--backend="):
+            return tok.split("=", 1)[1]
+    return None
 
 
 def _scan_lock_required(argv: list[str]) -> bool:
@@ -1959,13 +2333,25 @@ if __name__ == "__main__":
         main()
         sys.exit(0)
 
-    if _ollama_required(sys.argv[1:]):
-        try:
-            requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-        except (requests.ConnectionError, requests.Timeout):
-            configure_logging()
-            logger.error("Ollama not running. Start with: ollama serve")
-            sys.exit(1)
+    if _inference_required(sys.argv[1:]):
+        _apply_backend(_argv_backend(sys.argv[1:]))
+        if BACKEND == BACKEND_NOUS:
+            try:
+                requests.get(f"{NOUS_API_BASE}/models", timeout=NOUS_CONNECT_TIMEOUT)
+            except (requests.ConnectionError, requests.Timeout):
+                configure_logging()
+                logger.error(
+                    "Nous Portal unreachable at %s — check network access.",
+                    NOUS_API_BASE,
+                )
+                sys.exit(1)
+        else:
+            try:
+                requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+            except (requests.ConnectionError, requests.Timeout):
+                configure_logging()
+                logger.error("Ollama not running. Start with: ollama serve")
+                sys.exit(1)
 
     if _scan_lock_required(sys.argv[1:]):
         lock_fd = open(LOCK_FILE, "w")
