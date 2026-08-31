@@ -10,7 +10,7 @@ cd sentinel
 make setup
 ```
 
-Requires Python 3.10+ and [Ollama](https://ollama.com) running locally.
+Requires Python 3.10+ and an inference backend: [Ollama](https://ollama.com) running locally (the default), or a [Nous Portal](https://portal.nousresearch.com) API key in `NOUS_API_KEY` and `--backend nous`.
 
 ## Making changes
 
