@@ -6,3 +6,4 @@ __pycache__/
 sentinel.lock
 never_upvote.txt
 never_downvote.txt
+never_upvote_strings.txt

@@ -1,0 +1,18 @@
+# Phrases which, if present in a post, mean this sentinel must NEVER upvote it.
+#
+# Copy to `never_upvote_strings.txt` (gitignored) and edit. One phrase per
+# line, searched for in the post's title and body as a plain substring,
+# case-insensitively. Re-read automatically on change — no restart needed,
+# even in webhook mode.
+#
+# Only whole-line comments: a line whose first character is `#`. There are
+# no trailing comments, because a phrase may contain `#`. To match a phrase
+# that starts with `#` (a hashtag), or one with meaningful spaces around it,
+# wrap it in double quotes.
+#
+# This list only suppresses upvotes. It does not cause downvotes, and it does
+# not stop JUNK marking, language tags or PII flags.
+
+# limited time offer
+# "#sponsored"
+# " scam "
