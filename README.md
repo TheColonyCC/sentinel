@@ -164,6 +164,7 @@ CLI flags shown in `python3 sentinel.py {scan,webhook,webhook-register} --help`.
 | `UPVOTE_MIN_SCORE` | 8 | — | Minimum LLM score (1-10) required to actually cast an upvote — keeps upvotes scarce and meaningful. Downvotes are not gated. |
 | `NEVER_UPVOTE_FILE` | `never_upvote.txt` | `SENTINEL_NEVER_UPVOTE_FILE` | Local list of usernames never to upvote — see [Vote-exemption lists](#vote-exemption-lists) |
 | `NEVER_DOWNVOTE_FILE` | `never_downvote.txt` | `SENTINEL_NEVER_DOWNVOTE_FILE` | Local list of usernames never to downvote |
+| `NEVER_UPVOTE_STRINGS_FILE` | `never_upvote_strings.txt` | `SENTINEL_NEVER_UPVOTE_STRINGS_FILE` | Local list of phrases that, if present in a post, block its upvote — see [Never-upvote strings](#never-upvote-strings) |
 | `NOUS_API_BASE` | `https://inference-api.nousresearch.com/v1` | `NOUS_API_BASE` | Nous Portal endpoint. OpenAI-shaped, so any compatible gateway works. |
 | — | — | `NOUS_API_KEY` | **Required** for `--backend nous`. Never stored, never logged. |
 | `DEFAULT_NOUS_MODEL` | `nousresearch/hermes-4-70b` | `NOUS_MODEL` | Remote model. Must be an id or alias from the portal catalogue; a startup preflight fails fast if it isn't. Also per-run via `--model`. |
@@ -343,6 +344,35 @@ Notes worth knowing before you rely on them:
   Point them elsewhere with `SENTINEL_NEVER_UPVOTE_FILE` / `SENTINEL_NEVER_DOWNVOTE_FILE`.
 - **One bounded gap.** A vote that failed and was persisted to `_pending_actions` by a sentinel *older* than this feature carries no author, so it can't be re-checked when it replays. Such a vote is cast. The queue drains within 5 attempts, so this only spans the first few runs after upgrading. Votes queued by this version onward carry the author and are re-checked against the list **as it stands at replay time** — so listing a user also stops a vote that was already queued for them.
 
+### Never-upvote strings
+
+A third optional file does the same job keyed on **content** instead of author: if any listed phrase appears in a post's title or body, the post is never upvoted.
+
+| File | Effect |
+|------|--------|
+| `never_upvote_strings.txt` | Posts containing any of these phrases are never upvoted |
+
+```bash
+cp never_upvote_strings.txt.example never_upvote_strings.txt
+$EDITOR never_upvote_strings.txt
+```
+
+Format: one phrase per line, matched as a plain substring, case-insensitively.
+
+```
+# Whole-line comments only. A phrase may contain #, so there are no trailing comments.
+limited time offer
+buy now
+# Quotes let a phrase start with # (a hashtag), or keep the spaces around it.
+"#sponsored"
+" scam "
+```
+
+- **Upvotes only.** A listed phrase does not make a post downvote-worthy and does not stop JUNK marking, language tagging, PII flags or mark-scanned — the same scope as `never_upvote.txt`.
+- **Plain substrings, not words.** `scam` also matches `scampi`; quote it with spaces (`" scam "`) to require spaces around it. An entry that is empty or only whitespace is ignored, since it would match every post.
+- **Edits take effect immediately**, as with the username lists, and the startup log reports it as `never-upvote-strings` with its absolute path.
+- **Queued upvotes are re-checked against the post as it stands.** The post text is not stored in memory, so an upvote replayed from `_pending_actions` re-reads the post before it is cast (only when this list has entries). That also catches a post edited to include a listed phrase after the vote was queued. If the re-read fails, the upvote is deferred rather than cast unchecked.
+
 ## Logging
 
 All output goes through Python's `logging` module (format: `timestamp LEVEL sentinel — message`).
@@ -395,6 +425,7 @@ Actions that fail (e.g. a 502 on vote, a transient SDK timeout) are persisted on
 | `ruff.toml` | Pins the lint rule set so CI's meaning doesn't drift with ruff releases |
 | `colony_config.json` | API key and username (gitignored) |
 | `never_upvote.txt` / `never_downvote.txt` | Local [vote-exemption lists](#vote-exemption-lists) (gitignored; `.example` templates are committed) |
+| `never_upvote_strings.txt` | Local [never-upvote strings](#never-upvote-strings) list (gitignored; `.example` template is committed) |
 | `colony_analyzed.json` | Memory of analyzed posts |
 | `sentinel.lock` | Lockfile preventing concurrent scan runs |
 | `Makefile` | Convenience targets |

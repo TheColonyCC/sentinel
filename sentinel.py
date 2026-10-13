@@ -4,7 +4,8 @@
 Uses an LLM to score posts on quality — a local one via Ollama by default, or
 Nous Portal's hosted inference API when ``--backend nous`` is selected — then:
   - Casts votes (upvote good, downvote spam), subject to the local
-    ``never_upvote.txt`` / ``never_downvote.txt`` exemption lists
+    ``never_upvote.txt`` / ``never_downvote.txt`` exemption lists and the
+    ``never_upvote_strings.txt`` list of phrases that block an upvote
   - Marks JUNK posts (sentinel/admin role required)
   - Tags the primary language
 
@@ -207,6 +208,13 @@ UPVOTE_MIN_SCORE = 8
 # "never vote" list would take away the ability to express either alone.
 NEVER_UPVOTE_FILE = Path(_env_str("SENTINEL_NEVER_UPVOTE_FILE", "never_upvote.txt"))
 NEVER_DOWNVOTE_FILE = Path(_env_str("SENTINEL_NEVER_DOWNVOTE_FILE", "never_downvote.txt"))
+# The same idea keyed on CONTENT rather than author: phrases which, if they
+# appear anywhere in a post's title or body, mean this sentinel never upvotes
+# it. One phrase per line, case-insensitive. Upvotes only, like
+# never_upvote.txt — a listed phrase does not make a post downvote-worthy.
+NEVER_UPVOTE_STRINGS_FILE = Path(
+    _env_str("SENTINEL_NEVER_UPVOTE_STRINGS_FILE", "never_upvote_strings.txt")
+)
 
 # Webhook mode: process events in a background worker so the HTTP response
 # returns immediately. Keeps the public endpoint responsive when Ollama is
@@ -705,7 +713,12 @@ def _is_sandbox_colony(client: ColonyClient, colony_id: str) -> bool:
 # an operator add a username while a long-running webhook process is up and
 # have the very next vote honour it — a load-once-at-import cache would mean
 # a restart per edit, which is exactly the mode this feature matters in.
-_VOTE_EXEMPT_CACHE: dict[str, tuple[tuple[int, int] | None, frozenset[str]]] = {}
+#
+# Keyed on (parser, path) rather than path alone, so two lists pointed at the
+# same file by mistake can never be served each other's parse.
+_VOTE_EXEMPT_CACHE: dict[
+    tuple[str, str], tuple[tuple[int, int] | None, frozenset[str]]
+] = {}
 
 
 def _parse_username_list(text: str) -> frozenset[str]:
@@ -726,9 +739,43 @@ def _parse_username_list(text: str) -> frozenset[str]:
     return frozenset(names)
 
 
+def _parse_string_list(text: str) -> frozenset[str]:
+    """Parse the one-phrase-per-line never-upvote strings list.
+
+    Differs from the username lists in one deliberate way: there are no
+    trailing comments, because a phrase may legitimately contain ``#``. Only
+    a line whose first non-blank character is ``#`` is a comment. Surrounding
+    whitespace is trimmed; to match a phrase that itself starts with ``#`` (a
+    hashtag) or has meaningful surrounding spaces, wrap it in double quotes.
+    An entry that is empty or only whitespace is dropped — it would match
+    every post. Entries are casefolded: matching is case-insensitive, because
+    a list that only matched the casing the operator typed would fail OPEN.
+    """
+    out: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line) >= 2 and line[0] == line[-1] == '"':
+            line = line[1:-1]
+        if line.strip():
+            out.add(line.casefold())
+    return frozenset(out)
+
+
 def _load_username_list(path: Path) -> frozenset[str]:
+    """Read + cache a username exemption file, re-reading it on change."""
+    return _load_list(path, _parse_username_list)
+
+
+def _load_string_list(path: Path) -> frozenset[str]:
+    """Read + cache the never-upvote strings file, re-reading it on change."""
+    return _load_list(path, _parse_string_list)
+
+
+def _load_list(path: Path, parse) -> frozenset[str]:
     """Read + cache an exemption file, re-reading it whenever it changes."""
-    key = str(path)
+    key = (parse.__name__, str(path))
     try:
         st = path.stat()
         sig: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
@@ -740,7 +787,7 @@ def _load_username_list(path: Path) -> frozenset[str]:
     names: frozenset[str] = frozenset()
     if sig is not None:
         try:
-            names = _parse_username_list(path.read_text(encoding="utf-8"))
+            names = parse(path.read_text(encoding="utf-8"))
         except OSError as e:
             # Present but unreadable is an operator mistake (wrong perms, a
             # directory of that name) worth shouting about — but it must not
@@ -764,6 +811,33 @@ def vote_is_exempt(username: str | None, value: int) -> bool:
     return username.strip().lstrip("@").strip().lower() in _load_username_list(path)
 
 
+def post_text_for_lists(post: dict) -> str:
+    """The text the never-upvote strings are searched in: title + body."""
+    title = post.get("title") or ""
+    body = post.get("body") or post.get("content") or ""
+    return f"{title}\n{body}"
+
+
+def never_upvote_string_in(text: str | None) -> str | None:
+    """Return a listed phrase found in ``text`` (case-insensitive), else None.
+
+    Returns the phrase rather than a bool so every skip can be logged with
+    the entry that caused it — an operator who sees upvotes stop needs to
+    know WHICH line did it. Sorted so the reported phrase is deterministic
+    when several match.
+    """
+    if not text:
+        return None
+    phrases = _load_string_list(NEVER_UPVOTE_STRINGS_FILE)
+    if not phrases:
+        return None
+    haystack = text.casefold()
+    for phrase in sorted(phrases):
+        if phrase in haystack:
+            return phrase
+    return None
+
+
 def log_vote_exemptions() -> None:
     """Announce both lists at startup, with the path actually consulted.
 
@@ -773,11 +847,12 @@ def log_vote_exemptions() -> None:
     Sentinel resolves these relative to the CWD (as it does its config and
     memory), so the ABSOLUTE path is logged, not just a count.
     """
-    for label, path in (
-        ("never-upvote", NEVER_UPVOTE_FILE),
-        ("never-downvote", NEVER_DOWNVOTE_FILE),
+    for label, path, load in (
+        ("never-upvote", NEVER_UPVOTE_FILE, _load_username_list),
+        ("never-downvote", NEVER_DOWNVOTE_FILE, _load_username_list),
+        ("never-upvote-strings", NEVER_UPVOTE_STRINGS_FILE, _load_string_list),
     ):
-        names = _load_username_list(path)
+        names = load(path)
         state = f"{len(names)} entries" if path.exists() else "not present"
         logger.info("Vote exemptions — %s: %s (%s)", label, state, path.resolve())
 
@@ -1119,13 +1194,20 @@ def analyze_post(post_data: dict, model: str) -> dict | None:
     return result
 
 
-def _pending_actions(judgement: dict) -> list[dict]:
+def _pending_actions(judgement: dict, post_text: str | None = None) -> list[dict]:
     """Translate a judgement into a list of action dicts.
 
     Each dict is self-describing — ``{"kind": "vote", "value": 1}`` etc.
     This is the canonical format used for both the initial apply pass and
     for storing failures in memory for later retry, so a judgement from a
     previous run can be replayed without needing the LLM again.
+
+    ``post_text`` (title + body) is what the never-upvote strings list is
+    searched in. It is passed alongside the judgement rather than stored on
+    it, because the judgement is persisted to memory for every post and
+    carrying every post body there would bloat the file for no gain. When
+    it is absent the upvote is still checked, at apply time, by
+    ``_apply_action`` re-reading the post.
     """
     actions: list[dict] = []
 
@@ -1165,6 +1247,15 @@ def _pending_actions(judgement: dict) -> list[dict]:
             "never-upvote" if value > 0 else "never-downvote",
         )
         value = 0
+
+    if value > 0 and post_text is not None:
+        phrase = never_upvote_string_in(post_text)
+        if phrase is not None:
+            logger.info(
+                "Skipping upvote of post %s — contains %r from the never-upvote strings list",
+                str(judgement.get("post_id") or "")[:8], phrase,
+            )
+            value = 0
 
     if value != 0:
         vote_action: dict[str, Any] = {"kind": "vote", "value": value}
@@ -1221,11 +1312,14 @@ def _pending_actions(judgement: dict) -> list[dict]:
     return actions
 
 
-def _apply_action(client: ColonyClient, post_id: str, action: dict) -> bool:
+def _apply_action(
+    client: ColonyClient, post_id: str, action: dict, post_text: str | None = None,
+) -> bool:
     """Apply a single action. Returns True on success, False on failure.
 
     Isolated so retries can replay an action from memory without reshaping
-    the judgement dict.
+    the judgement dict. ``post_text`` is the post's title + body when the
+    caller has it; a replay does not, see the strings check below.
     """
     kind = action.get("kind")
     if kind == "vote":
@@ -1251,6 +1345,33 @@ def _apply_action(client: ColonyClient, post_id: str, action: dict) -> bool:
             # cast), not deferred. Returning False would re-queue it as a
             # failure and retry the same forbidden vote for 5 more runs.
             return True
+        # The strings list, re-checked at apply time for the same reason as
+        # the username lists. The post text is never stored with the action
+        # (see ``_pending_actions``), so a replayed upvote re-reads the post
+        # — which also catches a post EDITED to include a listed phrase since
+        # the vote was queued. Only when the list is non-empty: with no
+        # phrases there is nothing to check and no reason to spend a request.
+        if _value > 0 and _load_string_list(NEVER_UPVOTE_STRINGS_FILE):
+            text = post_text
+            if text is None:
+                try:
+                    text = post_text_for_lists(client.get_post(post_id))
+                except ColonyAPIError as e:
+                    # Fail CLOSED: an upvote we cannot check is not cast. It
+                    # stays pending and is retried, then dropped after 5.
+                    logger.warning(
+                        "Could not re-read post %s to check the never-upvote strings: %s"
+                        " — deferring the upvote",
+                        post_id[:8], e,
+                    )
+                    return False
+            phrase = never_upvote_string_in(text)
+            if phrase is not None:
+                logger.info(
+                    "Not upvoting post %s — contains %r from the never-upvote strings list",
+                    post_id[:8], phrase,
+                )
+                return True             # resolved, not deferred — as above
         try:
             client.vote_post(post_id, int(action["value"]))
             logger.info(
@@ -1304,14 +1425,17 @@ def act_on_judgement(
     allow_pii: bool = True,
     allow_mark_scanned: bool = True,
     confirm: bool = False,
+    post_text: str | None = None,
 ) -> list[dict]:
     """Apply all actions derived from a judgement.
 
     Returns the list of actions that FAILED, so the caller can persist them
     to memory for retry on the next run. An empty list means everything
-    succeeded (or nothing was needed).
+    succeeded (or nothing was needed). ``post_text`` (title + body, see
+    ``post_text_for_lists``) is what the never-upvote strings are matched
+    against; without it an upvote is checked by re-reading the post.
     """
-    actions = _pending_actions(judgement)
+    actions = _pending_actions(judgement, post_text)
     allowed: list[dict] = []
     for a in actions:
         kind = a["kind"]
@@ -1348,7 +1472,7 @@ def act_on_judgement(
     for a in allowed:
         if a.get("_skipped"):
             continue
-        ok = _apply_action(client, post_id, a)
+        ok = _apply_action(client, post_id, a, post_text)
         if not ok:
             failed.append(a)
     return failed
@@ -1688,6 +1812,7 @@ def _process_post(
             allow_vote=not args.no_vote,
             allow_pii=not args.no_pii,
             confirm=args.confirm,
+            post_text=post_text_for_lists(post_data["post"]),
         )
         if failed:
             judgement["_pending_actions"] = failed
@@ -1977,6 +2102,7 @@ class WebhookWorker:
             allow_lang=self.allow_lang,
             allow_pii=self.allow_pii,
             allow_mark_scanned=self.allow_mark_scanned,
+            post_text=post_text_for_lists(post_data["post"]),
         )
         if failed:
             judgement["_pending_actions"] = failed
